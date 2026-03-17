@@ -34,12 +34,15 @@ class CredentialsStore {
   private encryptionKey: Buffer;
 
   constructor() {
-    this.store = new Store<{ credentials: StoredCredential[] }>({
+    const storeOptions: any = {
       name: 'credentials',
+      projectName: 'open-cowork',
       defaults: {
         credentials: [],
       },
-    });
+    };
+
+    this.store = new Store<{ credentials: StoredCredential[] }>(storeOptions);
 
     // Generate or retrieve encryption key
     // In production, this should be derived from a master password or system keychain
@@ -51,7 +54,8 @@ class CredentialsStore {
    * Stored separately from credentials for security
    */
   private getOrCreateEncryptionKey(): Buffer {
-    const keyStore = new Store<{ key: string }>({ name: 'credentials-key' });
+    const keyStoreOptions: any = { name: 'credentials-key', projectName: 'open-cowork' };
+    const keyStore = new Store<{ key: string }>(keyStoreOptions);
     let key = keyStore.get('key');
     
     if (!key) {

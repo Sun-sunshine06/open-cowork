@@ -1,6 +1,7 @@
 import { useEffect, useCallback, useRef } from 'react';
 import { useAppStore } from '../store';
 import type {
+  AppConfig,
   ClientEvent,
   ServerEvent,
   PermissionResult,
@@ -110,6 +111,19 @@ export function useIPC() {
       const store = storeRef.current;
       console.log('[useIPC] Received event:', event.type);
 
+      const applyConfigSnapshot = (config: AppConfig, isConfigured: boolean) => {
+        const isInitialConfigStatus = !store.hasSeenInitialConfigStatus;
+        store.setIsConfigured(isConfigured);
+        store.setAppConfig(config);
+        store.setSettings({ theme: config.theme || 'light' });
+        if (isInitialConfigStatus) {
+          store.markInitialConfigStatusSeen();
+        }
+        if (isInitialConfigStatus && !isConfigured) {
+          store.setShowConfigModal(true);
+        }
+      };
+
       switch (event.type) {
         case 'session.list':
           store.setSessions(event.payload.sessions);
@@ -208,15 +222,7 @@ export function useIPC() {
 
         case 'config.status': {
           console.log('[useIPC] config.status received:', event.payload.isConfigured);
-          const isInitialConfigStatus = !store.hasSeenInitialConfigStatus;
-          store.setIsConfigured(event.payload.isConfigured);
-          store.setAppConfig(event.payload.config);
-          if (isInitialConfigStatus) {
-            store.markInitialConfigStatusSeen();
-          }
-          if (isInitialConfigStatus && !event.payload.isConfigured) {
-            store.setShowConfigModal(true);
-          }
+          applyConfigSnapshot(event.payload.config, event.payload.isConfigured);
           break;
         }
 
@@ -314,8 +320,37 @@ export function useIPC() {
       }
     });
 
+    let disposed = false;
+    void (async () => {
+      try {
+        const [config, isConfigured, systemTheme] = await Promise.all([
+          window.electronAPI.config.get(),
+          window.electronAPI.config.isConfigured(),
+          window.electronAPI.getSystemTheme(),
+        ]);
+        if (disposed) {
+          return;
+        }
+        const store = storeRef.current;
+        store.setSystemDarkMode(Boolean(systemTheme?.shouldUseDarkColors));
+        const isInitialConfigStatus = !store.hasSeenInitialConfigStatus;
+        store.setIsConfigured(Boolean(isConfigured));
+        store.setAppConfig(config);
+        store.setSettings({ theme: config.theme || 'light' });
+        if (isInitialConfigStatus) {
+          store.markInitialConfigStatusSeen();
+          if (!isConfigured) {
+            store.setShowConfigModal(true);
+          }
+        }
+      } catch (error) {
+        console.error('[useIPC] Failed to bootstrap config/theme state:', error);
+      }
+    })();
+
     // Cleanup on unmount only
     return () => {
+      disposed = true;
       console.log('[useIPC] Cleaning up IPC listener');
       if (partialRafId !== null) cancelAnimationFrame(partialRafId);
       if (thinkingRafId !== null) cancelAnimationFrame(thinkingRafId);

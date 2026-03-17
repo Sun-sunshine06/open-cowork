@@ -21,14 +21,17 @@ class RemoteConfigStore {
   private store: Store<RemoteConfig & { pairedUsers: PairedUser[] }>;
   
   constructor() {
-    this.store = new Store<RemoteConfig & { pairedUsers: PairedUser[] }>({
+    const storeOptions: any = {
       name: 'remote-config',
+      projectName: 'open-cowork',
       defaults: {
         ...DEFAULT_REMOTE_CONFIG,
         pairedUsers: [],
       },
       encryptionKey: 'open-cowork-remote-v1',
-    });
+    };
+
+    this.store = new Store<RemoteConfig & { pairedUsers: PairedUser[] }>(storeOptions);
     
     // Migrate: change pairing mode to allowlist (allow everyone by default)
     this.migrateAuthMode();

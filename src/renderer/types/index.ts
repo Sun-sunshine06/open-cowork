@@ -399,7 +399,7 @@ export type ServerEvent =
 
 // Settings types
 export interface Settings {
-  theme: 'dark' | 'light' | 'system';
+  theme: AppTheme;
   apiKey?: string;
   defaultTools: string[];
   permissionRules: PermissionRule[];
@@ -428,6 +428,7 @@ export interface ExecutionContext {
 // App Config types
 export type ProviderType = 'openrouter' | 'anthropic' | 'custom' | 'openai' | 'gemini' | 'ollama';
 export type CustomProtocolType = 'anthropic' | 'openai' | 'gemini';
+export type AppTheme = 'dark' | 'light' | 'system';
 export type ProviderProfileKey =
   | 'openrouter'
   | 'anthropic'
@@ -480,6 +481,7 @@ export interface AppConfig {
   claudeCodePath?: string;
   defaultWorkdir?: string;
   globalSkillsPath?: string;
+  theme?: AppTheme;
   sandboxEnabled?: boolean;
   enableThinking?: boolean;
   isConfigured: boolean;
