@@ -59,6 +59,7 @@ export class SessionManager {
   private sessionTitleAttempts: Set<string> = new Set();
   private titleGenerationTokens: Map<string, symbol> = new Map();
   private messageCache: Map<string, Message[]> = new Map();
+  private static readonly MAX_CACHE_SIZE = 100;
 
   constructor(
     db: DatabaseInstance,
@@ -180,6 +181,10 @@ export class SessionManager {
       log(`[SessionManager] Initialized ${servers.length} MCP servers`);
     } catch (error) {
       logError('[SessionManager] Failed to initialize MCP servers:', error);
+      this.sendToRenderer({
+        type: 'error',
+        payload: { message: `Failed to initialize MCP servers: ${error instanceof Error ? error.message : String(error)}` },
+      });
     }
   }
 
@@ -280,6 +285,22 @@ export class SessionManager {
     const row = this.db.sessions.get(sessionId);
     if (!row) return null;
 
+    let mountedPaths;
+    try {
+      mountedPaths = JSON.parse(row.mounted_paths);
+    } catch (e) {
+      logError('[SessionManager] Failed to parse mounted_paths:', e);
+      mountedPaths = [];
+    }
+
+    let allowedTools;
+    try {
+      allowedTools = JSON.parse(row.allowed_tools);
+    } catch (e) {
+      logError('[SessionManager] Failed to parse allowed_tools:', e);
+      allowedTools = [];
+    }
+
     return {
       id: row.id,
       title: row.title,
@@ -287,8 +308,8 @@ export class SessionManager {
       openaiThreadId: row.openai_thread_id || undefined,
       status: row.status as Session['status'],
       cwd: row.cwd || undefined,
-      mountedPaths: JSON.parse(row.mounted_paths),
-      allowedTools: JSON.parse(row.allowed_tools),
+      mountedPaths,
+      allowedTools,
       memoryEnabled: row.memory_enabled === 1,
       model: row.model || undefined,
       createdAt: row.created_at,
@@ -300,20 +321,38 @@ export class SessionManager {
   listSessions(): Session[] {
     const rows = this.db.sessions.getAll();
 
-    return rows.map((row) => ({
-      id: row.id,
-      title: row.title,
-      claudeSessionId: row.claude_session_id || undefined,
-      openaiThreadId: row.openai_thread_id || undefined,
-      status: row.status as Session['status'],
-      cwd: row.cwd || undefined,
-      mountedPaths: JSON.parse(row.mounted_paths),
-      allowedTools: JSON.parse(row.allowed_tools),
-      memoryEnabled: row.memory_enabled === 1,
-      model: row.model || undefined,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    }));
+    return rows.map((row) => {
+      let mountedPaths;
+      try {
+        mountedPaths = JSON.parse(row.mounted_paths);
+      } catch (e) {
+        logError('[SessionManager] Failed to parse mounted_paths:', e);
+        mountedPaths = [];
+      }
+
+      let allowedTools;
+      try {
+        allowedTools = JSON.parse(row.allowed_tools);
+      } catch (e) {
+        logError('[SessionManager] Failed to parse allowed_tools:', e);
+        allowedTools = [];
+      }
+
+      return {
+        id: row.id,
+        title: row.title,
+        claudeSessionId: row.claude_session_id || undefined,
+        openaiThreadId: row.openai_thread_id || undefined,
+        status: row.status as Session['status'],
+        cwd: row.cwd || undefined,
+        mountedPaths,
+        allowedTools,
+        memoryEnabled: row.memory_enabled === 1,
+        model: row.model || undefined,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      };
+    });
   }
 
   // Continue an existing session
@@ -383,6 +422,10 @@ export class SessionManager {
       log('[SessionManager] Sandbox mode:', this.sandboxAdapter.mode);
     } catch (error) {
       logError('[SessionManager] Failed to initialize sandbox:', error);
+      this.sendToRenderer({
+        type: 'error',
+        payload: { message: `Failed to initialize sandbox: ${error instanceof Error ? error.message : String(error)}` },
+      });
       // Continue anyway - sandbox adapter will fallback to native
     } finally {
       this.sandboxInitPromises.delete(session.cwd);
@@ -474,6 +517,10 @@ export class SessionManager {
           });
         } catch (error) {
           logError('[SessionManager] Error copying file:', error);
+          this.sendToRenderer({
+            type: 'error',
+            payload: { message: `Failed to process file attachment: ${error instanceof Error ? error.message : String(error)}` },
+          });
           // Skip this file attachment
         }
       } else {
@@ -490,7 +537,7 @@ export class SessionManager {
     const traceId = generateTraceId();
     return runWithLogContext({ sessionId: session.id, traceId }, async () => {
     logCtx('[SessionManager] Processing prompt for session:', session.id, 'traceId:', traceId);
-    logCtx('[SessionManager] Received content:', content ? JSON.stringify(content.map((c: any) => ({ type: c.type, hasData: !!c.source?.data }))) : 'none');
+    logCtx('[SessionManager] Received content:', content ? JSON.stringify(content.map((c) => ({ type: c.type, hasData: !!(c as { source?: { data?: unknown } }).source?.data }))) : 'none');
 
     // Ensure sandbox is initialized for this workspace
     await this.ensureSandboxInitialized(session);
@@ -504,7 +551,7 @@ export class SessionManager {
       // Process file attachments - copy to .tmp directory
       messageContent = await this.processFileAttachments(session, messageContent);
 
-      logCtx('[SessionManager] Final message content types:', messageContent.map((c: any) => c.type));
+      logCtx('[SessionManager] Final message content types:', messageContent.map((c) => c.type));
 
       // Build enhanced prompt with file information
       let enhancedPrompt = prompt;
@@ -659,7 +706,13 @@ export class SessionManager {
     this.promptQueues.set(session.id, queue);
 
     if (!this.activeSessions.has(session.id)) {
-      void this.processQueue(session);
+      this.processQueue(session).catch(err => {
+        logError('[SessionManager] Queue processing error:', err);
+        this.sendToRenderer({
+          type: 'error',
+          payload: { message: `Failed to process message: ${err instanceof Error ? err.message : String(err)}` },
+        });
+      });
     } else {
       log('[SessionManager] Session running, queued prompt:', session.id);
     }
@@ -673,40 +726,56 @@ export class SessionManager {
     this.updateSessionStatus(session.id, 'running');
 
     try {
-      while (!controller.signal.aborted) {
-        const queue = this.promptQueues.get(session.id);
-        if (!queue || queue.length === 0) break;
+      // Outer loop: after the inner loop drains, re-check for items that
+      // arrived while processPrompt was awaited. This keeps the session in
+      // activeSessions the entire time, preventing enqueuePrompt from
+      // spawning a duplicate processQueue during the gap that previously
+      // existed between activeSessions.delete and the restart call.
+      while (true) {
+        while (!controller.signal.aborted) {
+          const queue = this.promptQueues.get(session.id);
+          if (!queue || queue.length === 0) break;
 
-        const item = queue.shift();
-        if (!item) continue;
+          const item = queue.shift();
+          if (!item) continue;
 
-        const latestSession = this.loadSession(session.id);
-        if (!latestSession) {
-          log('[SessionManager] Session removed while processing queue:', session.id);
-          break;
+          const latestSession = this.loadSession(session.id);
+          if (!latestSession) {
+            log('[SessionManager] Session removed while processing queue:', session.id);
+            return; // finally handles cleanup
+          }
+
+          await this.processPrompt(latestSession, item.prompt, item.content);
+
+          if (controller.signal.aborted) return; // finally handles cleanup
         }
 
-        await this.processPrompt(latestSession, item.prompt, item.content);
-
+        // If aborted, exit immediately — finally handles cleanup.
         if (controller.signal.aborted) break;
+
+        // Re-check: items may have been enqueued during the last processPrompt await.
+        const pendingQueue = this.promptQueues.get(session.id);
+        if (!pendingQueue || pendingQueue.length === 0) break;
+
+        // Reload session before continuing with newly arrived prompts.
+        const latestSession = this.loadSession(session.id);
+        if (!latestSession) {
+          this.promptQueues.delete(session.id);
+          break;
+        }
+        session = latestSession;
+        log('[SessionManager] Continuing queue with newly arrived prompts:', session.id);
       }
     } finally {
+      // Only clean up here — no restart logic needed since the outer loop
+      // already handles re-checking. activeSessions is only deleted once
+      // there are truly no pending items remaining.
       this.activeSessions.delete(session.id);
       const queue = this.promptQueues.get(session.id);
       if (queue && queue.length === 0) {
         this.promptQueues.delete(session.id);
       }
       this.updateSessionStatus(session.id, 'idle');
-      const pendingQueue = this.promptQueues.get(session.id);
-      if (pendingQueue && pendingQueue.length > 0) {
-        const latestSession = this.loadSession(session.id);
-        if (latestSession) {
-          log('[SessionManager] Restarting queued prompts after stop/drain:', session.id);
-          void this.processQueue(latestSession);
-        } else {
-          this.promptQueues.delete(session.id);
-        }
-      }
     }
   }
 
@@ -729,6 +798,7 @@ export class SessionManager {
       controller.abort();
     }
     this.promptQueues.delete(sessionId);
+    this.messageCache.delete(sessionId);
     this.updateSessionStatus(sessionId, 'idle');
   }
 
@@ -831,6 +901,15 @@ export class SessionManager {
     const cached = this.messageCache.get(message.sessionId);
     if (cached) {
       cached.push(message);
+    } else {
+      // Only evict when the cache could actually grow (i.e. the session is
+      // not cached yet). Evicting on every saveMessage call is wrong because
+      // the Map size didn't increase — we just appended to an existing array —
+      // and the oldest entry could be the very session we just updated.
+      if (this.messageCache.size > SessionManager.MAX_CACHE_SIZE) {
+        const firstKey = this.messageCache.keys().next().value;
+        if (firstKey) this.messageCache.delete(firstKey);
+      }
     }
     
     log('[SessionManager] Message saved:', message.id, 'role:', message.role);
@@ -917,7 +996,15 @@ export class SessionManager {
     input: Record<string, unknown>
   ): Promise<PermissionResult> {
     return new Promise((resolve) => {
-      this.pendingPermissions.set(toolUseId, resolve);
+      const timeoutId = setTimeout(() => {
+        this.pendingPermissions.delete(toolUseId);
+        resolve('deny');
+        this.sendToRenderer({ type: 'permission.dismiss', payload: { toolUseId } });
+      }, 60_000);
+      this.pendingPermissions.set(toolUseId, (result: PermissionResult) => {
+        clearTimeout(timeoutId);
+        resolve(result);
+      });
       this.sendToRenderer({
         type: 'permission.request',
         payload: { toolUseId, toolName, input, sessionId },

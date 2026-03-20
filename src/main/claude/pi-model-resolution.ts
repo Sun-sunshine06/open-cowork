@@ -3,7 +3,7 @@ import { isOfficialOpenAIBaseUrl } from '../config/auth-utils';
 
 const COMMON_FALLBACK_PROVIDERS = ['openai', 'anthropic', 'google'] as const;
 const INVALID_REGISTRY_PROVIDERS = new Set(['', 'custom']);
-const REASONING_MODEL_PATTERN = /\bthinking\b|\breasoner\b|deepseek-r1|kimi-k2/i;
+const REASONING_MODEL_PATTERN = /\bthinking\b|\breasoner\b|deepseek-r1|kimi-k2|qwen3(?:\.5)?(?=[:/-]|$)/i;
 type PiRegistryProvider = Parameters<typeof getModel>[0];
 
 export interface PiModelStringInput {
@@ -171,7 +171,7 @@ export function resolveSyntheticPiModelFallback(
     };
   }
 
-  const fallbackProvider = input.rawProvider === 'custom'
+  const fallbackProvider = input.rawProvider === 'custom' || input.rawProvider === 'ollama'
     ? (input.routeProtocol || 'anthropic')
     : (parsedProvider || input.rawProvider || input.routeProtocol || 'anthropic');
 
@@ -287,6 +287,30 @@ export function applyPiModelRuntimeOverrides(
     } as typeof nextModel;
   }
 
+  if (
+    options.rawProvider === 'ollama'
+    && nextModel.reasoning
+    && nextModel.api === 'openai-completions'
+  ) {
+    const currentCompat = (nextModel.compat || {}) as Record<string, unknown>;
+    const currentReasoningEffortMap = (
+      currentCompat.reasoningEffortMap && typeof currentCompat.reasoningEffortMap === 'object'
+        ? currentCompat.reasoningEffortMap
+        : {}
+    ) as Record<string, string>;
+    nextModel = {
+      ...nextModel,
+      compat: {
+        ...currentCompat,
+        supportsReasoningEffort: true,
+        reasoningEffortMap: {
+          ...currentReasoningEffortMap,
+          off: 'none',
+        },
+      },
+    } as typeof nextModel;
+  }
+
   // Handle custom provider with explicit protocol override
   if (isCustomProvider && options.customProtocol) {
     const targetApi = inferPiApi(options.customProtocol);
@@ -303,7 +327,8 @@ export function resolvePiRegistryModel(
   options: PiModelLookupOptions = {},
 ): Model<Api> | undefined {
   for (const candidate of buildPiModelLookupCandidates(modelString, options)) {
-    const model = (getModel as any)(candidate.provider as PiRegistryProvider, candidate.model) as Model<Api> | undefined;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const model = (getModel as (...args: unknown[]) => Model<Api> | undefined)(candidate.provider as PiRegistryProvider, candidate.model);
     if (model) {
       return applyPiModelRuntimeOverrides(model, options);
     }

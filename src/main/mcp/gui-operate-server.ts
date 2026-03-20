@@ -30,14 +30,14 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 writeMCPLog('Imported MCP SDK modules', 'Bootstrap');
 
-import { exec, spawn } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs/promises';
 writeMCPLog('Imported Node.js built-in modules', 'Bootstrap');
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 // Detect platform
 const PLATFORM = os.platform(); // 'darwin' for macOS, 'win32' for Windows
@@ -146,8 +146,8 @@ async function saveLastAppContext(appName: string): Promise<void> {
     await fs.mkdir(GUI_APPS_DIR, { recursive: true });
     const payload: LastAppContext = { appName, savedAt: Date.now() };
     await fs.writeFile(GUI_LAST_APP_FILE, JSON.stringify(payload, null, 2), 'utf-8');
-  } catch (error: any) {
-    writeMCPLog(`[App Context] Failed to save last app context: ${error.message}`, 'App Init Warning');
+  } catch (error: unknown) {
+    writeMCPLog(`[App Context] Failed to save last app context: ${error instanceof Error ? error.message : String(error)}`, 'App Init Warning');
   }
 }
 
@@ -183,7 +183,6 @@ async function inferMostRecentAppNameFromDisk(): Promise<string | null> {
 
 async function restoreLastAppContext(): Promise<boolean> {
   if (currentAppName) return true;
-  if (os.platform() !== 'darwin') return false;
 
   try {
     const data = await fs.readFile(GUI_LAST_APP_FILE, 'utf-8');
@@ -202,8 +201,8 @@ async function restoreLastAppContext(): Promise<boolean> {
     writeMCPLog(`[App Context] Restoring last app context: "${appName}"`, 'App Init');
     await loadClickHistoryForApp(appName);
     return true;
-  } catch (error: any) {
-    if (error?.code === 'ENOENT') {
+  } catch (error: unknown) {
+    if (error instanceof Error && (error as NodeJS.ErrnoException).code === 'ENOENT') {
       // Backward compatibility: if we don't have last-app metadata yet, infer from disk.
       const inferred = await inferMostRecentAppNameFromDisk();
       if (!inferred) return false;
@@ -212,7 +211,7 @@ async function restoreLastAppContext(): Promise<boolean> {
       await saveLastAppContext(inferred);
       return true;
     }
-    writeMCPLog(`[App Context] Failed to restore last app context: ${error.message}`, 'App Init Warning');
+    writeMCPLog(`[App Context] Failed to restore last app context: ${error instanceof Error ? error.message : String(error)}`, 'App Init Warning');
     return false;
   }
 }
@@ -374,8 +373,8 @@ async function getAllVisitedApps(): Promise<string[]> {
     
     writeMCPLog(`[getAllVisitedApps] Found ${actualAppNames.length} visited apps`, 'App List');
     return actualAppNames;
-  } catch (error: any) {
-    writeMCPLog(`[getAllVisitedApps] Error reading visited apps: ${error.message}`, 'App List Error');
+  } catch (error: unknown) {
+    writeMCPLog(`[getAllVisitedApps] Error reading visited apps: ${error instanceof Error ? error.message : String(error)}`, 'App List Error');
     return [];
   }
 }
@@ -433,8 +432,8 @@ async function loadClickHistoryForApp(appName: string): Promise<void> {
       currentAppName = appName;
       
       writeMCPLog(`[ClickHistory] Loaded ${clickHistory.length} clicks for app "${appName}" from ${filePath}`, 'Click History Load');
-    } catch (error: any) {
-      if (error.code === 'ENOENT') {
+    } catch (error: unknown) {
+      if (error instanceof Error && (error as NodeJS.ErrnoException).code === 'ENOENT') {
         // File doesn't exist, start fresh
         clickHistory = [];
         clickHistoryCounter = 0;
@@ -444,8 +443,8 @@ async function loadClickHistoryForApp(appName: string): Promise<void> {
         throw error;
       }
     }
-  } catch (error: any) {
-    writeMCPLog(`[ClickHistory] Error loading history: ${error.message}`, 'Click History Load Error');
+  } catch (error: unknown) {
+    writeMCPLog(`[ClickHistory] Error loading history: ${error instanceof Error ? error.message : String(error)}`, 'Click History Load Error');
     // Fallback to empty history
     clickHistory = [];
     clickHistoryCounter = 0;
@@ -481,8 +480,8 @@ async function saveLatestClickToHistory(
     try {
       const data = await fs.readFile(filePath, 'utf-8');
       existingHistory = JSON.parse(data);
-    } catch (error: any) {
-      if (error.code === 'ENOENT') {
+    } catch (error: unknown) {
+      if (error instanceof Error && (error as NodeJS.ErrnoException).code === 'ENOENT') {
         // File doesn't exist, create new history
         existingHistory = {
           appName: currentAppName,
@@ -557,8 +556,8 @@ async function saveLatestClickToHistory(
     await fs.writeFile(filePath, JSON.stringify(existingHistory, null, 2), 'utf-8');
     
     writeMCPLog(`[ClickHistory] Saved latest click for app "${currentAppName}" to ${filePath}`, 'Click History Save');
-  } catch (error: any) {
-    writeMCPLog(`[ClickHistory] Error saving latest click: ${error.message}`, 'Click History Save Error');
+  } catch (error: unknown) {
+    writeMCPLog(`[ClickHistory] Error saving latest click: ${error instanceof Error ? error.message : String(error)}`, 'Click History Save Error');
   }
 }
 
@@ -602,8 +601,8 @@ async function initApp(appName: string): Promise<{
     guide = await fs.readFile(guidePath, 'utf-8');
     hasGuide = true;
     writeMCPLog(`[App Init] Loaded guide.md for app "${appName}" (${guide.length} chars)`, 'App Init');
-  } catch (error: any) {
-    if (error?.code !== 'ENOENT') {
+  } catch (error: unknown) {
+    if (error instanceof Error && (error as NodeJS.ErrnoException).code !== 'ENOENT') {
       writeMCPLog(`[App Init] Failed to read guide.md for app "${appName}": ${error.message}`, 'App Init Warning');
     }
   }
@@ -690,8 +689,8 @@ async function clearClickHistory(): Promise<void> {
       const filePath = getAppClickHistoryFilePath(currentAppName);
       await fs.unlink(filePath);
       writeMCPLog(`[ClickHistory] Deleted click history file: ${filePath}`, 'Click History');
-    } catch (error: any) {
-      if (error.code !== 'ENOENT') {
+    } catch (error: unknown) {
+      if (error instanceof Error && (error as NodeJS.ErrnoException).code !== 'ENOENT') {
         writeMCPLog(`[ClickHistory] Error deleting click history file: ${error.message}`, 'Click History Error');
       }
     }
@@ -976,30 +975,31 @@ async function resolvePythonExec(): Promise<PythonExec | null> {
       writeMCPLog(`[resolvePythonExec] Dev mode: which/where command failed: ${error instanceof Error ? error.message : String(error)}`, 'Python Resolve');
     }
     
-    // Fallback: try 'python3' directly (will use PATH from current environment)
-    // This handles cases where which/where doesn't work but python3 is in PATH
-    writeMCPLog('[resolvePythonExec] Dev mode: Trying python3 --version as fallback', 'Python Resolve');
+    // Fallback: try 'python3' (or 'python' on Windows) directly
+    // This handles cases where which/where doesn't work but python is in PATH
+    const python3Cmd = PLATFORM === 'win32' ? 'python' : 'python3';
+    writeMCPLog(`[resolvePythonExec] Dev mode: Trying ${python3Cmd} --version as fallback`, 'Python Resolve');
     try {
-      const testResult = await executeCommand('python3 --version', 2000);
-      writeMCPLog(`[resolvePythonExec] Dev mode: python3 --version result: stdout=${testResult.stdout}, stderr=${testResult.stderr}`, 'Python Resolve');
+      const testResult = await executeCommand(`${python3Cmd} --version`, 2000);
+      writeMCPLog(`[resolvePythonExec] Dev mode: ${python3Cmd} --version result: stdout=${testResult.stdout}, stderr=${testResult.stderr}`, 'Python Resolve');
       if (testResult.stdout || testResult.stderr) {
-        // python3 is available, try to get its full path for consistency
-        let pythonPath = 'python3';
+        // python is available, try to get its full path for consistency
+        let pythonPath = python3Cmd;
         try {
-          const whichResult = await executeCommand(PLATFORM === 'win32' ? 'where python3' : 'which python', 2000);
+          const whichResult = await executeCommand(PLATFORM === 'win32' ? `where ${python3Cmd}` : `which ${python3Cmd}`, 2000);
           const resolvedPath = whichResult.stdout.trim().split(/\r?\n/).filter(Boolean)[0];
-          writeMCPLog(`[resolvePythonExec] Dev mode: Resolved python3 path: ${resolvedPath}`, 'Python Resolve');
+          writeMCPLog(`[resolvePythonExec] Dev mode: Resolved ${python3Cmd} path: ${resolvedPath}`, 'Python Resolve');
           if (resolvedPath && await pathExists(resolvedPath)) {
             pythonPath = resolvedPath;
           }
         } catch (error) {
-          writeMCPLog(`[resolvePythonExec] Dev mode: Failed to resolve python3 path: ${error instanceof Error ? error.message : String(error)}`, 'Python Resolve');
-          // If which/where fails, just use 'python3' command name
+          writeMCPLog(`[resolvePythonExec] Dev mode: Failed to resolve ${python3Cmd} path: ${error instanceof Error ? error.message : String(error)}`, 'Python Resolve');
+          // If which/where fails, just use the command name directly
         }
-        
+
         cachedPythonExec = {
           python: pythonPath,
-          pythonRoot: pythonPath !== 'python3' ? path.resolve(pythonPath, '..', '..') : '',
+          pythonRoot: pythonPath !== python3Cmd ? path.resolve(pythonPath, '..', '..') : '',
           env: {
             ...baseEnv, // Keep all current environment variables (including conda settings)
             // Don't set PYTHONHOME in dev mode to preserve conda/venv environment
@@ -1008,11 +1008,11 @@ async function resolvePythonExec(): Promise<PythonExec | null> {
             PYTHONUTF8: '1',
           },
         };
-        writeMCPLog(`[resolvePythonExec] Dev mode: Using python3 (${pythonPath}) from current environment`, 'Python Resolve');
+        writeMCPLog(`[resolvePythonExec] Dev mode: Using ${python3Cmd} (${pythonPath}) from current environment`, 'Python Resolve');
         return cachedPythonExec;
       }
     } catch (error) {
-      writeMCPLog(`[resolvePythonExec] Dev mode: python3 --version test failed: ${error instanceof Error ? error.message : String(error)}`, 'Python Resolve');
+      writeMCPLog(`[resolvePythonExec] Dev mode: ${python3Cmd} --version test failed: ${error instanceof Error ? error.message : String(error)}`, 'Python Resolve');
     }
     writeMCPLog('[resolvePythonExec] Dev mode: Failed to find Python in current environment, falling back to bundled Python', 'Python Resolve');
   }
@@ -1367,20 +1367,42 @@ async function macWriteClipboardBytes(bytes: Buffer, timeoutMs: number = 5000): 
 }
 
 /**
- * Execute a shell command with timeout
+ * Execute a command with timeout using execFile (no shell interpolation).
+ * The command string is parsed into executable + arguments respecting quotes.
  */
 async function executeCommand(
   command: string,
   timeout: number = 10000
 ): Promise<{ stdout: string; stderr: string }> {
+  // Parse command into executable and arguments, respecting quotes
+  const tokens: string[] = [];
+  let current = '';
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+    } else if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+    } else if (ch === ' ' && !inSingle && !inDouble) {
+      if (current) { tokens.push(current); current = ''; }
+    } else {
+      current += ch;
+    }
+  }
+  if (current) tokens.push(current);
+
+  const [executable, ...args] = tokens;
+
   try {
-    const result = await execAsync(command, { timeout });
+    const result = await execFileAsync(executable, args, { timeout });
     return {
-      stdout: result.stdout,
-      stderr: result.stderr,
+      stdout: typeof result.stdout === 'string' ? result.stdout : '',
+      stderr: typeof result.stderr === 'string' ? result.stderr : '',
     };
-  } catch (error: any) {
-    throw new Error(`Command execution failed: ${error.message}`);
+  } catch (error: unknown) {
+    throw new Error(`Command execution failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -1394,7 +1416,8 @@ async function getFrontmostMacApplicationName(): Promise<string | null> {
     );
     const name = stdout.trim();
     return name || null;
-  } catch {
+  } catch (error) {
+    writeMCPLog(`[GuiOperateServer] Error getting frontmost app: ${error}`, 'getFrontmostMacApplicationName');
     return null;
   }
 }
@@ -1551,8 +1574,8 @@ async function executeCliclick(command: string): Promise<{ stdout: string; stder
   }
 
   return result;
-  } catch (error: any) {
-    const baseMessage = error?.message || String(error);
+  } catch (error: unknown) {
+    const baseMessage = error instanceof Error ? error.message : String(error);
     const hint =
       '\n\nmacOS 权限提示 / Permissions:\n' +
       '- System Settings → Privacy & Security → Accessibility：允许 Open Cowork\n' +
@@ -2429,8 +2452,8 @@ async function getDisplayConfiguration(): Promise<DisplayConfiguration> {
       displayConfigCache = config;
       displayConfigCacheTime = now;
       return config;
-    } catch (error: any) {
-      throw new Error(`Failed to get display information on Windows: ${error.message}`);
+    } catch (error: unknown) {
+      throw new Error(`Failed to get display information on Windows: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
   
@@ -2607,9 +2630,9 @@ async function getDisplayConfiguration(): Promise<DisplayConfiguration> {
     displayConfigCacheTime = now;
     
     return config;
-  } catch (error: any) {
+  } catch (error: unknown) {
     // Fallback: Use system_profiler for basic info
-    writeMCPLog(`AppleScript display detection failed, using fallback: ${error.message}`, 'Display Detection');
+    writeMCPLog(`AppleScript display detection failed, using fallback: ${error instanceof Error ? error.message : String(error)}`, 'Display Detection');
     
     try {
       const result = await executeCommand('system_profiler SPDisplaysDataType -json');
@@ -2661,8 +2684,8 @@ async function getDisplayConfiguration(): Promise<DisplayConfiguration> {
       displayConfigCacheTime = now;
       
       return config;
-    } catch (fallbackError: any) {
-      throw new Error(`Failed to get display information: ${fallbackError.message}`);
+    } catch (fallbackError: unknown) {
+      throw new Error(`Failed to get display information: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`);
     }
   }
 }
@@ -2777,8 +2800,8 @@ async function resolveClickCoordinates(
     return convertNormalizedToDisplayCoordinates(xInput, yInput, displayIndex);
   }
 
-  let x = Math.round(xInput);
-  let y = Math.round(yInput);
+  const x = Math.round(xInput);
+  const y = Math.round(yInput);
 
   if (coordinateType === 'auto') {
     const isOutOfBounds = x < 0 || y < 0 || x >= display.width || y >= display.height;
@@ -2831,7 +2854,7 @@ async function performClick(
     await ensureAppContextRestored();
   }
 
-  let localX = x;
+  const localX = x;
   let localY = y;
 
   // Dock auto-hide on macOS can swallow the first click near the bottom edge.
@@ -2943,6 +2966,7 @@ async function performType(
   }
 
   // macOS implementation
+  // eslint-disable-next-line no-control-regex
   const hasNonAscii = /[^\x00-\x7F]/.test(text);
   const usePaste = inputMethod === 'paste' || (inputMethod === 'auto' && hasNonAscii);
 
@@ -3389,8 +3413,8 @@ async function takeScreenshot(
 
   try {
   await executeCommand(command);
-  } catch (error: any) {
-    const baseMessage = error?.message || String(error);
+  } catch (error: unknown) {
+    const baseMessage = error instanceof Error ? error.message : String(error);
     const hint =
       '\n\nmacOS 权限提示 / Permissions:\n' +
       '- System Settings → Privacy & Security → Screen Recording：允许 Open Cowork\n' +
@@ -3434,7 +3458,7 @@ async function takeScreenshotForDisplay(
   screenshotRequestCounts.set(requestKey, requestCount);
   const reusable = forceRefresh ? null : getReusableScreenshot(normalizedDisplayIndex, regionKey);
   if (reusable) {
-    const reusedMetadata: Record<string, any> = {
+    const reusedMetadata: Record<string, unknown> = {
       success: true,
       path: reusable.path,
       displayIndex: reusable.displayIndex,
@@ -3479,7 +3503,7 @@ async function takeScreenshotForDisplay(
   // Take the screenshot first
   await takeScreenshot(tempPath, displayIndex, region);
 
-  let finalPath = tempPath;
+  const finalPath = tempPath;
 
   // Read the screenshot file and convert to base64
   const imageBuffer = await fs.readFile(finalPath);
@@ -3490,7 +3514,7 @@ async function takeScreenshotForDisplay(
   const display = config.displays.find(d => d.index === normalizedDisplayIndex) || config.displays[0];
 
   // Build response metadata
-  const metadata: Record<string, any> = {
+  const metadata: Record<string, unknown> = {
     success: true,
     path: finalPath,
     displayIndex: normalizedDisplayIndex,
@@ -3686,9 +3710,9 @@ async function callVisionAPI(
       
       writeMCPLog(`${logPrefix} Attempt ${attempt}/${MAX_RETRIES} - Success`, 'API Request');
       return result;
-    } catch (error: any) {
+    } catch (error: unknown) {
       const isLastAttempt = attempt === MAX_RETRIES;
-      const errorMessage = String(error?.message || error || '');
+      const errorMessage = String(error instanceof Error ? error.message : error || '');
 
       // Deterministic request-shape errors should fail fast instead of wasting retries.
       if (isVisionRequestShapeError(errorMessage)) {
@@ -3710,8 +3734,8 @@ async function callVisionAPI(
             );
             writeMCPLog(`${logPrefix} Compatibility fallback succeeded`, 'API Request');
             return compatResult;
-          } catch (compatError: any) {
-            const compatMessage = String(compatError?.message || compatError || '');
+          } catch (compatError: unknown) {
+            const compatMessage = String(compatError instanceof Error ? compatError.message : compatError || '');
             writeMCPLog(`${logPrefix} Compatibility fallback failed: ${compatMessage}`, 'API Request Error');
             throw new Error(compatMessage || errorMessage);
           }
@@ -3874,15 +3898,18 @@ async function callVisionAPIWithTimeout(
       : `${openAIBaseUrl}/v1/chat/completions`;
     
     // Use Node.js built-in https module for better compatibility
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
     const https = require('https');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
     const http = require('http');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
     const url = require('url');
     
     const urlObj = new url.URL(openAIUrl);
     const isHttps = urlObj.protocol === 'https:';
     const httpModule = isHttps ? https : http;
     
-    const requestBodyObj: any = {
+    const requestBodyObj: Record<string, unknown> = {
       model: model,
       messages: [
         {
@@ -3906,7 +3933,7 @@ async function callVisionAPIWithTimeout(
     
     const requestBody = JSON.stringify(requestBodyObj);
     
-    const headers: any = {
+    const headers: Record<string, string | number> = {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${selectedApiKey}`,
       'Content-Length': Buffer.byteLength(requestBody),
@@ -3916,11 +3943,12 @@ async function callVisionAPIWithTimeout(
       headers['HTTP-Referer'] = 'https://github.com/OpenCoworkAI/open-cowork';
       headers['X-Title'] = 'Open Cowork';
     }
-    
+
     return new Promise<string>((resolve, reject) => {
-      let timeoutId: NodeJS.Timeout;
+      // eslint-disable-next-line prefer-const
+      let timeoutId: ReturnType<typeof setTimeout>;
       let isResolved = false;
-      
+
       const options = {
         hostname: urlObj.hostname,
         port: urlObj.port || (isHttps ? 443 : 80),
@@ -3929,33 +3957,34 @@ async function callVisionAPIWithTimeout(
         headers: headers,
         timeout: timeoutMs,
       };
-      
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const req = httpModule.request(options, (res: any) => {
         let data = '';
-        
+
         res.on('data', (chunk: Buffer) => {
           data += chunk.toString();
         });
-        
+
         res.on('end', () => {
           if (isResolved) return;
           clearTimeout(timeoutId);
-          
+
           if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
             try {
               writeMCPLog(`[callVisionAPIWithTimeout] Response received, length: ${data.length}`, 'API Response');
               const jsonData = JSON.parse(data);
               const responseContent = jsonData.choices[0]?.message?.content || '';
-              
+
               // Log the response
               const logLabel = functionName ? `Vision API Response [${functionName}]` : 'Vision API Response';
               writeMCPLog(responseContent, logLabel);
-              
+
               isResolved = true;
               resolve(responseContent);
-            } catch (e: any) {
+            } catch (e: unknown) {
               isResolved = true;
-              reject(new Error(`Failed to parse API response: ${e.message}`));
+              reject(new Error(`Failed to parse API response: ${e instanceof Error ? e.message : String(e)}`));
             }
           } else {
             isResolved = true;
@@ -3993,6 +4022,7 @@ async function callVisionAPIWithTimeout(
     });
   } else {
     // Use Anthropic API format
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
     const Anthropic = require('@anthropic-ai/sdk');
     const anthropicRouteBaseUrl = anthropicBaseUrl || baseUrl;
     const anthropicRouteModel = anthropicModel || model;
@@ -4044,8 +4074,8 @@ async function callVisionAPIWithTimeout(
       writeMCPLog(`[callVisionAPIWithTimeout] Response received, length: ${responseContent.length}`, 'API Response');
       
       return responseContent;
-    } catch (error: any) {
-      if (error.message.includes('timeout')) {
+    } catch (error: unknown) {
+      if (error instanceof Error && error.message.includes('timeout')) {
         throw new Error(`API request timeout after ${timeoutMs}ms`);
       }
       throw error;
@@ -4205,7 +4235,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 try:
     # Load image
-    img = Image.open('${screenshotPath.replace(/'/g, "\\'")}')
+    img = Image.open('${screenshotPath.replace(/\\/g, '/').replace(/'/g, "\\'")}')
     img_width, img_height = img.size
     scale_factor = ${scaleFactor}
     
@@ -4346,7 +4376,7 @@ try:
     img = img.convert('RGB')
     
     # Save annotated image
-    img.save('${annotatedPath.replace(/'/g, "\\'")}')
+    img.save('${annotatedPath.replace(/\\/g, '/').replace(/'/g, "\\'")}')
     print('SUCCESS')
     
 except Exception as e:
@@ -4365,8 +4395,8 @@ except Exception as e:
       writeMCPLog(`[annotateScreenshot] Python script did not return SUCCESS: ${result.stdout}`, 'Screenshot Annotation Error');
       throw new Error('Failed to annotate screenshot');
     }
-  } catch (error: any) {
-    writeMCPLog(`[annotateScreenshot] Error annotating screenshot: ${error.message}`, 'Screenshot Annotation Error');
+  } catch (error: unknown) {
+    writeMCPLog(`[annotateScreenshot] Error annotating screenshot: ${error instanceof Error ? error.message : String(error)}`, 'Screenshot Annotation Error');
     // Fallback: return original path if annotation fails
     return {
       annotatedPath: screenshotPath,
@@ -4456,10 +4486,10 @@ async function analyzeScreenshotWithVision(
       writeMCPLog(`[analyzeScreenshotWithVision] Attempting to parse JSON (first 200 chars): ${jsonMatch[0].substring(0, 200)}`, 'JSON Parse');
       result = JSON.parse(jsonMatch[0]);
       writeMCPLog(`[analyzeScreenshotWithVision] JSON parsed successfully`, 'JSON Parse Success');
-    } catch (parseError: any) {
-      writeMCPLog(`[analyzeScreenshotWithVision] JSON parse failed: ${parseError.message}`, 'JSON Parse Error');
+    } catch (parseError: unknown) {
+      writeMCPLog(`[analyzeScreenshotWithVision] JSON parse failed: ${parseError instanceof Error ? parseError.message : String(parseError)}`, 'JSON Parse Error');
       writeMCPLog(`[analyzeScreenshotWithVision] JSON string that failed to parse: ${jsonMatch[0]}`, 'JSON Parse Error');
-      throw new Error(`Failed to parse JSON: ${parseError.message}. JSON string: ${jsonMatch[0].substring(0, 500)}`);
+      throw new Error(`Failed to parse JSON: ${parseError instanceof Error ? parseError.message : String(parseError)}. JSON string: ${jsonMatch[0].substring(0, 500)}`);
     }
 
     // Validate that box_2d exists and is an array
@@ -4516,8 +4546,8 @@ async function analyzeScreenshotWithVision(
         bottom: ymax_pixel
       }
     };
-  } catch (error: any) {
-    throw new Error(`Vision analysis failed: ${error.message}`);
+  } catch (error: unknown) {
+    throw new Error(`Vision analysis failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -4591,8 +4621,8 @@ except Exception as e:
     } else {
       throw new Error(result.stdout || result.stderr || 'Unknown error');
     }
-  } catch (error: any) {
-    writeMCPLog(`[markPointOnImage] Could not mark image: ${error.message}`, 'Image Marking Warning');
+  } catch (error: unknown) {
+    writeMCPLog(`[markPointOnImage] Could not mark image: ${error instanceof Error ? error.message : String(error)}`, 'Image Marking Warning');
     writeMCPLog(`[markPointOnImage] To enable image marking, install Pillow: pip3 install Pillow`, 'Image Marking Warning');
     return imagePath; // Return original path if marking fails
   }
@@ -4630,8 +4660,8 @@ async function getImageDimensions(imagePath: string): Promise<{ width: number; h
     }
     
     throw new Error('Could not determine image dimensions');
-  } catch (error: any) {
-    // Fallback: use display dimensions
+  } catch (error: unknown) {
+    void error; // intentionally empty - fall through to display dimensions fallback
     const config = await getDisplayConfiguration();
     const mainDisplay = config.displays.find(d => d.isMain) || config.displays[0];
     return { width: mainDisplay.width, height: mainDisplay.height };
@@ -4732,10 +4762,10 @@ Be specific and detailed in element descriptions. For example:
     writeMCPLog(`[planGUIActions] Attempting to parse JSON (first 200 chars): ${jsonMatch[0].substring(0, 200)}`, 'JSON Parse');
     plan = JSON.parse(jsonMatch[0]);
     writeMCPLog(`[planGUIActions] JSON parsed successfully. Steps count: ${plan.steps?.length || 0}`, 'JSON Parse Success');
-  } catch (parseError: any) {
-    writeMCPLog(`[planGUIActions] JSON parse failed: ${parseError.message}`, 'JSON Parse Error');
+  } catch (parseError: unknown) {
+    writeMCPLog(`[planGUIActions] JSON parse failed: ${parseError instanceof Error ? parseError.message : String(parseError)}`, 'JSON Parse Error');
     writeMCPLog(`[planGUIActions] JSON string that failed to parse: ${jsonMatch[0]}`, 'JSON Parse Error');
-    throw new Error(`Failed to parse action plan JSON: ${parseError.message}. JSON string: ${jsonMatch[0].substring(0, 500)}`);
+    throw new Error(`Failed to parse action plan JSON: ${parseError instanceof Error ? parseError.message : String(parseError)}. JSON string: ${jsonMatch[0].substring(0, 500)}`);
   }
   
   if (!plan.steps || !Array.isArray(plan.steps)) {
@@ -4773,8 +4803,8 @@ async function locateGUIElement(
       if (dockCoords) {
         return dockCoords;
       }
-    } catch (dockError: any) {
-      writeMCPLog(`[locateGUIElement] Dock accessibility lookup failed: ${dockError.message}`, 'Dock Locate Warning');
+    } catch (dockError: unknown) {
+      writeMCPLog(`[locateGUIElement] Dock accessibility lookup failed: ${dockError instanceof Error ? dockError.message : String(dockError)}`, 'Dock Locate Warning');
     }
   }
   
@@ -4808,9 +4838,9 @@ async function locateGUIElement(
       const markedPath = await markPointOnImage(screenshotPath, pixelX, pixelY, undefined, coords.boundingBox);
       writeMCPLog(`[locateGUIElement] Marked screenshot saved to: ${markedPath}`, 'Image Marking');
     }
-  } catch (markError: any) {
+  } catch (markError: unknown) {
     // Don't fail if marking fails, just log the error
-    writeMCPLog(`[locateGUIElement] Failed to mark screenshot: ${markError.message}`, 'Image Marking Warning');
+    writeMCPLog(`[locateGUIElement] Failed to mark screenshot: ${markError instanceof Error ? markError.message : String(markError)}`, 'Image Marking Warning');
   }
 
   return coords;
@@ -4934,14 +4964,16 @@ async function executeActionStep(
           error: `Unsupported action: ${step.action}`,
         };
     }
-  } catch (error: any) {
-    writeMCPLog(`[executeActionStep] Step ${step.step}: Error occurred: ${error.message}`, 'Step Execution Error');
-    writeMCPLog(`[executeActionStep] Step ${step.step}: Error stack: ${error.stack}`, 'Step Execution Error');
+  } catch (error: unknown) {
+    const errMsg = error instanceof Error ? error.message : String(error);
+    const errStack = error instanceof Error ? error.stack : undefined;
+    writeMCPLog(`[executeActionStep] Step ${step.step}: Error occurred: ${errMsg}`, 'Step Execution Error');
+    writeMCPLog(`[executeActionStep] Step ${step.step}: Error stack: ${errStack}`, 'Step Execution Error');
     return {
       success: false,
       step: step.step,
       action: step.action,
-      error: error.message,
+      error: errMsg,
     };
   }
 }
@@ -4968,8 +5000,8 @@ async function performVisionBasedInteraction(
     plan = await planGUIActions(taskDescription, displayIndex);
     writeMCPLog(`[performVisionBasedInteraction] Planning completed. Total steps: ${plan.steps.length}`, 'Task Planning');
     writeMCPLog(`[performVisionBasedInteraction] Plan summary: ${plan.summary || 'No summary'}`, 'Task Planning');
-  } catch (error: any) {
-    writeMCPLog(`[performVisionBasedInteraction] Planning failed: ${error.message}`, 'Task Planning Error');
+  } catch (error: unknown) {
+    writeMCPLog(`[performVisionBasedInteraction] Planning failed: ${error instanceof Error ? error.message : String(error)}`, 'Task Planning Error');
     throw error;
   }
   
@@ -5876,14 +5908,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         },
       ],
     };
-  } catch (error: any) {
+  } catch (error: unknown) {
     return {
       content: [
         {
           type: 'text',
           text: JSON.stringify({
             error: true,
-            message: error.message,
+            message: error instanceof Error ? error.message : String(error),
             tool: name,
           }),
         },

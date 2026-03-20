@@ -24,7 +24,8 @@ type AttachedFile = {
   inlineDataBase64?: string;
 };
 
-const welcomeLogoSrc = new URL('../../../resources/logo.png', import.meta.url).href;
+// Served from public/ as a static asset — works in both dev and packaged builds
+const welcomeLogoSrc = '/logo.png';
 
 export function WelcomeView() {
   const { t } = useTranslation();
@@ -41,6 +42,9 @@ export function WelcomeView() {
   const { startSession, changeWorkingDir, isElectron } = useIPC();
   const workingDir = useAppStore((state) => state.workingDir);
   const setGlobalNotice = useAppStore((state) => state.setGlobalNotice);
+  const isConfigured = useAppStore((state) => state.isConfigured);
+  const setShowSettings = useAppStore((state) => state.setShowSettings);
+  const setSettingsTab = useAppStore((state) => state.setSettingsTab);
   const canSubmit = prompt.trim().length > 0 || pastedImages.length > 0 || attachedFiles.length > 0;
 
   const handleSelectFolder = async () => {
@@ -89,7 +93,7 @@ export function WelcomeView() {
         newImages.push({
           url,
           base64,
-          mediaType: resizedBlob.type as any,
+          mediaType: resizedBlob.type,
         });
       } catch (err) {
         console.error('Failed to process pasted image:', err);
@@ -216,7 +220,7 @@ export function WelcomeView() {
       if (filePaths.length === 0) return;
 
       const newFiles = filePaths.map((filePath) => {
-        const fileName = filePath.split('/').pop() || filePath.split('\\').pop() || 'unknown';
+        const fileName = filePath.split(/[/\\]/).pop() || 'unknown';
         return {
           name: fileName,
           path: filePath,
@@ -316,7 +320,7 @@ export function WelcomeView() {
         type: 'image',
         source: {
           type: 'base64',
-          media_type: img.mediaType as any,
+          media_type: img.mediaType as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
           data: img.base64,
         },
       });
@@ -455,6 +459,24 @@ export function WelcomeView() {
             {t('welcome.title')}
           </p>
         </div>
+
+        {/* API Not Configured Hint */}
+        {!isConfigured && (
+          <p className="text-sm text-text-muted text-center">
+            {t('welcome.apiNotConfigured')}{' '}
+            <button
+              type="button"
+              onClick={() => {
+                setSettingsTab('api');
+                setShowSettings(true);
+              }}
+              className="inline-flex items-center gap-1 text-accent hover:text-accent-hover transition-colors"
+            >
+              {t('welcome.goToSettings')}
+              <ArrowRight className="w-3.5 h-3.5" />
+            </button>
+          </p>
+        )}
 
         {/* Quick Action Tags */}
         <div className="flex flex-wrap gap-2 justify-center px-3">

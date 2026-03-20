@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import { glob } from 'glob';
@@ -162,9 +163,18 @@ export class ToolExecutor {
       throw new Error('Only http/https URLs are supported');
     }
 
-    const response = await fetch(parsed.toString(), {
-      headers: { 'User-Agent': 'open-cowork' },
-    });
+    let response: Response;
+    try {
+      response = await fetch(parsed.toString(), {
+        headers: { 'User-Agent': 'open-cowork' },
+        signal: AbortSignal.timeout(15000),
+      });
+    } catch (error) {
+      if (error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError')) {
+        throw new Error('请求超时，请检查网络连接后重试');
+      }
+      throw error;
+    }
 
     if (!response.ok) {
       throw new Error(`Request failed with status ${response.status}`);
@@ -196,9 +206,18 @@ export class ToolExecutor {
     searchUrl.searchParams.set('no_html', '1');
     searchUrl.searchParams.set('skip_disambig', '1');
 
-    const response = await fetch(searchUrl.toString(), {
-      headers: { 'User-Agent': 'open-cowork' },
-    });
+    let response: Response;
+    try {
+      response = await fetch(searchUrl.toString(), {
+        headers: { 'User-Agent': 'open-cowork' },
+        signal: AbortSignal.timeout(10000),
+      });
+    } catch (error) {
+      if (error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError')) {
+        throw new Error('请求超时，请检查网络连接后重试');
+      }
+      throw error;
+    }
 
     if (!response.ok) {
       throw new Error(`Search request failed with status ${response.status}`);
@@ -276,6 +295,7 @@ export class ToolExecutor {
     }
 
     // Block path traversal attempts
+    // eslint-disable-next-line no-useless-escape
     if (/(?:^|[\s;|&])\.\.(?:[\s;|&\/\\]|$)/.test(command) || command.includes('../') || command.includes('..\\')) {
       throw new Error('Command blocked: path traversal (..) is not allowed');
     }
@@ -283,6 +303,7 @@ export class ToolExecutor {
     // Extract potential paths from command (quoted strings and unquoted tokens)
     const pathPatterns = [
       // Windows absolute paths: C:\... or C:/...
+      // eslint-disable-next-line no-useless-escape
       /[A-Za-z]:[\\\/][^\s;|&"'<>]*/g,
       // UNC absolute paths: \\server\share\...
       /\\\\[^\s;|&"'<>]+/g,
@@ -323,6 +344,7 @@ export class ToolExecutor {
 
     // Block dangerous patterns
     const dangerousPatterns = [
+      // eslint-disable-next-line no-useless-escape
       /rm\s+-rf?\s+[\/~]/i,
       /dd\s+if=/i,
       /mkfs/i,
@@ -357,7 +379,11 @@ export class ToolExecutor {
       const isWindows = process.platform === 'win32';
       const shell = isWindows ? 'powershell.exe' : '/bin/bash';
       const args = isWindows
-        ? ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', `chcp 65001 > $null; ${command}`]
+        ? (() => {
+            const scriptPath = path.join(os.tmpdir(), `oc-exec-${Date.now()}.ps1`);
+            fs.writeFileSync(scriptPath, `chcp 65001 > $null; ${command}`, 'utf-8');
+            return ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath];
+          })()
         : ['-c', command];
 
       const proc = spawn(shell, args, {
@@ -382,6 +408,7 @@ export class ToolExecutor {
       });
 
       proc.on('close', (code) => {
+        if (isWindows && args[args.length - 1]?.endsWith('.ps1')) { try { fs.unlinkSync(args[args.length - 1]); } catch { /* cleanup best-effort */ } }
         if (code === 0) {
           resolve(stdout || 'Command completed successfully');
         } else {
@@ -793,7 +820,11 @@ export class ToolExecutor {
       const isWindows = process.platform === 'win32';
       const shell = isWindows ? 'powershell.exe' : '/bin/bash';
       const args = isWindows
-        ? ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', `chcp 65001 > $null; ${command}`]
+        ? (() => {
+            const scriptPath = path.join(os.tmpdir(), `oc-exec-${Date.now()}.ps1`);
+            fs.writeFileSync(scriptPath, `chcp 65001 > $null; ${command}`, 'utf-8');
+            return ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath];
+          })()
         : ['-c', command];
 
       const proc = spawn(shell, args, {
@@ -818,6 +849,7 @@ export class ToolExecutor {
       });
 
       proc.on('close', (code) => {
+        if (isWindows && args[args.length - 1]?.endsWith('.ps1')) { try { fs.unlinkSync(args[args.length - 1]); } catch { /* cleanup best-effort */ } }
         if (code === 0) {
           resolve({ success: true, output: stdout || 'Command completed' });
         } else {

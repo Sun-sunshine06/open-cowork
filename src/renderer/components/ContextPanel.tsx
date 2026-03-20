@@ -32,15 +32,15 @@ import {
 } from 'lucide-react';
 import type { TraceStep, MCPServerInfo } from '../types';
 
+const EMPTY_STEPS: TraceStep[] = [];
+
 export function ContextPanel() {
   const { t } = useTranslation();
   const activeSessionId = useAppStore((s) => s.activeSessionId);
   const sessions = useAppStore((s) => s.sessions);
-  const traceStepsBySession = useAppStore((s) => s.traceStepsBySession);
-  const messagesBySession = useAppStore((s) => s.messagesBySession);
+  const sessionStates = useAppStore((s) => s.sessionStates);
   const appConfig = useAppStore((s) => s.appConfig);
   const contextPanelCollapsed = useAppStore((s) => s.contextPanelCollapsed);
-  const contextWindowBySession = useAppStore((s) => s.contextWindowBySession);
   const toggleContextPanel = useAppStore((s) => s.toggleContextPanel);
   const workingDir = useAppStore((s) => s.workingDir);
   const setGlobalNotice = useAppStore((s) => s.setGlobalNotice);
@@ -72,7 +72,8 @@ export function ContextPanel() {
     }
   };
 
-  const steps = activeSessionId ? traceStepsBySession[activeSessionId] || [] : [];
+  const ss = activeSessionId ? sessionStates[activeSessionId] : undefined;
+  const steps = ss?.traceSteps ?? EMPTY_STEPS;
   const activeSession = activeSessionId ? sessions.find(s => s.id === activeSessionId) : null;
   const currentWorkingDir = activeSession?.cwd || workingDir;
   const { displayArtifactSteps } = getArtifactSteps(steps);
@@ -80,8 +81,8 @@ export function ContextPanel() {
 
   // Session info computations
   const messages = useMemo(
-    () => (activeSessionId ? messagesBySession[activeSessionId] || [] : []),
-    [activeSessionId, messagesBySession]
+    () => (activeSessionId ? sessionStates[activeSessionId]?.messages || [] : []),
+    [activeSessionId, sessionStates]
   );
   const messageCount = messages.length;
   const toolCallCount = steps.filter((s) => s.type === 'tool_call').length;
@@ -102,7 +103,7 @@ export function ContextPanel() {
 
   // Context usage: last message's input tokens ≈ current context occupation
   const contextUsage = useMemo(() => {
-    const contextWindow = activeSessionId ? contextWindowBySession[activeSessionId] : undefined;
+    const contextWindow = activeSessionId ? sessionStates[activeSessionId]?.contextWindow : undefined;
     if (!contextWindow) return null;
 
     let lastInput = 0;
@@ -116,10 +117,11 @@ export function ContextPanel() {
 
     const percentage = Math.min((lastInput / contextWindow) * 100, 100);
     return { used: lastInput, total: contextWindow, percentage };
-  }, [activeSessionId, contextWindowBySession, messages]);
-  const artifactStepKey = useMemo(
-    () => displayArtifactSteps.map((step) => step.id).join('|'),
-    [displayArtifactSteps]
+  }, [activeSessionId, sessionStates, messages]);
+
+  const completedStepCount = useMemo(
+    () => steps.reduce((n, s) => n + (s.status === 'completed' ? 1 : 0), 0),
+    [steps]
   );
 
   useEffect(() => {
@@ -131,14 +133,13 @@ export function ContextPanel() {
       || !window.electronAPI?.artifacts?.listRecentFiles
       || !currentWorkingDir
       || !activeSession?.createdAt
-      || !displayArtifactSteps.length
     ) {
       setRecentWorkspaceFiles([]);
       return;
     }
 
     let cancelled = false;
-    const loadRecentWorkspaceFiles = async () => {
+    const timer = setTimeout(async () => {
       try {
         const files = await window.electronAPI.artifacts.listRecentFiles(
           currentWorkingDir,
@@ -154,19 +155,19 @@ export function ContextPanel() {
           setRecentWorkspaceFiles([]);
         }
       }
-    };
+    }, 500);
 
-    void loadRecentWorkspaceFiles();
     return () => {
       cancelled = true;
+      clearTimeout(timer);
     };
   }, [
     activeSession?.createdAt,
     activeSessionId,
-    artifactStepKey,
+    steps.length,
+    completedStepCount,
     contextPanelCollapsed,
     currentWorkingDir,
-    displayArtifactSteps.length,
   ]);
 
   const displayArtifacts = useMemo(() => {
@@ -360,7 +361,7 @@ export function ContextPanel() {
 
                   return (
                     <div
-                      key={index}
+                      key={artifact.path || artifact.label || `artifact-${index}`}
                       className={`flex items-center gap-2 px-4 py-1.5 transition-colors ${canClick ? 'cursor-pointer hover:bg-surface-hover' : ''}`}
                       onClick={async () => {
                         if (!canClick) return;
@@ -373,7 +374,7 @@ export function ContextPanel() {
                           });
                         }
                       }}
-                      title={canClick ? artifactPath : undefined}
+                      title={artifactPath || undefined}
                     >
                       <IconComponent className="w-3.5 h-3.5 text-text-muted shrink-0" />
                       <span className="text-xs text-text-primary truncate">{label}</span>
@@ -465,7 +466,7 @@ export function ContextPanel() {
           {mcpServers.length === 0 ? (
             <div className="flex items-center gap-2 text-xs text-text-muted py-1">
               <Plug className="w-3.5 h-3.5 shrink-0" />
-              <span>{t('context.noConnectors')}</span>
+              <span>{t('mcp.noConnectors')}</span>
             </div>
           ) : (
             <div className="space-y-0.5">
@@ -550,8 +551,8 @@ function ConnectorItem({
           </div>
           {server.connected && (
             <p className="text-xs text-text-muted">
-              {server.toolCount} tools
-              {usageCount > 0 && ` • ${usageCount} calls`}
+              {t('mcp.toolCount', { count: server.toolCount })}
+              {usageCount > 0 && ` • ${t('mcp.callCount', { count: usageCount })}`}
             </p>
           )}
         </div>

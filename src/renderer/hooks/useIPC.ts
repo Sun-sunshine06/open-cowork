@@ -107,24 +107,23 @@ export function useIPC() {
       }
     };
 
+    const applyConfigSnapshot = (config: AppConfig, isConfigured: boolean) => {
+      const store = storeRef.current;
+      const isInitialConfigStatus = !store.hasSeenInitialConfigStatus;
+      store.setIsConfigured(isConfigured);
+      store.setAppConfig(config);
+      store.setSettings({ theme: config.theme || 'light' });
+      if (isInitialConfigStatus) {
+        store.markInitialConfigStatusSeen();
+      }
+    };
+
     const cleanup = window.electronAPI.on((event: ServerEvent) => {
       const store = storeRef.current;
       console.log('[useIPC] Received event:', event.type);
 
-      const applyConfigSnapshot = (config: AppConfig, isConfigured: boolean) => {
-        const isInitialConfigStatus = !store.hasSeenInitialConfigStatus;
-        store.setIsConfigured(isConfigured);
-        store.setAppConfig(config);
-        store.setSettings({ theme: config.theme || 'light' });
-        if (isInitialConfigStatus) {
-          store.markInitialConfigStatusSeen();
-        }
-        if (isInitialConfigStatus && !isConfigured) {
-          store.setShowConfigModal(true);
-        }
-      };
-
-      switch (event.type) {
+      try {
+        switch (event.type) {
         case 'session.list':
           store.setSessions(event.payload.sessions);
           break;
@@ -171,8 +170,9 @@ export function useIPC() {
         case 'trace.step': {
           if (event.payload.step.type === 'thinking' && event.payload.step.status === 'running') {
             const currentState = useAppStore.getState();
-            const pending = currentState.pendingTurnsBySession[event.payload.sessionId] || [];
-            const activeTurn = currentState.activeTurnsBySession[event.payload.sessionId];
+            const ss = currentState.sessionStates[event.payload.sessionId];
+            const pending = ss?.pendingTurns || [];
+            const activeTurn = ss?.activeTurn;
             if (pending.length > 0) {
               store.activateNextTurn(event.payload.sessionId, event.payload.step.id);
             } else if (activeTurn) {
@@ -263,22 +263,6 @@ export function useIPC() {
           store.setSessionContextWindow(event.payload.sessionId, event.payload.contextWindow);
           break;
 
-        case 'proxy.warmup':
-          if (event.payload.status === 'warming') {
-            store.setGlobalNotice({
-              id: 'proxy-warmup',
-              type: 'info',
-              message: i18n.t('api.proxyWarming'),
-              messageKey: 'api.proxyWarming',
-            });
-          } else {
-            const current = useAppStore.getState().globalNotice;
-            if (current?.id === 'proxy-warmup') {
-              store.clearGlobalNotice();
-            }
-          }
-          break;
-
         case 'error':
           console.error('[useIPC] Server error:', event.payload.message);
           store.setLoading(false);
@@ -318,6 +302,9 @@ export function useIPC() {
         default:
           console.log('[useIPC] Unknown server event:', event);
       }
+      } catch (err) {
+        console.error('[useIPC] Error handling server event:', event.type, err);
+      }
     });
 
     let disposed = false;
@@ -333,16 +320,7 @@ export function useIPC() {
         }
         const store = storeRef.current;
         store.setSystemDarkMode(Boolean(systemTheme?.shouldUseDarkColors));
-        const isInitialConfigStatus = !store.hasSeenInitialConfigStatus;
-        store.setIsConfigured(Boolean(isConfigured));
-        store.setAppConfig(config);
-        store.setSettings({ theme: config.theme || 'light' });
-        if (isInitialConfigStatus) {
-          store.markInitialConfigStatusSeen();
-          if (!isConfigured) {
-            store.setShowConfigModal(true);
-          }
-        }
+        applyConfigSnapshot(config, Boolean(isConfigured));
       } catch (error) {
         console.error('[useIPC] Failed to bootstrap config/theme state:', error);
       }
@@ -531,8 +509,9 @@ export function useIPC() {
       const store = useAppStore.getState();
       const isSessionRunning =
         store.sessions.find((session) => session.id === sessionId)?.status === 'running';
-      const hasActiveTurn = Boolean(store.activeTurnsBySession[sessionId]);
-      const hasPending = (store.pendingTurnsBySession[sessionId]?.length ?? 0) > 0;
+      const ss = store.sessionStates[sessionId];
+      const hasActiveTurn = Boolean(ss?.activeTurn);
+      const hasPending = (ss?.pendingTurns?.length ?? 0) > 0;
       const shouldQueue = isSessionRunning || hasActiveTurn || hasPending;
       const userMessage: Message = {
         id: `msg-user-${Date.now()}`,
@@ -576,15 +555,25 @@ export function useIPC() {
         activateNextTurn(sessionId, mockStepId);
       }
 
-      send({
-        type: 'session.continue',
-        payload: {
-          sessionId,
-          prompt,
-          content, // Send full content blocks including images
-        },
-      });
-      // Loading will be reset when we receive session.status event
+      try {
+        send({
+          type: 'session.continue',
+          payload: {
+            sessionId,
+            prompt,
+            content, // Send full content blocks including images
+          },
+        });
+        // Loading will be reset when we receive session.status event
+      } catch (e) {
+        setLoading(false);
+        useAppStore.getState().setGlobalNotice({
+          id: `notice-session-continue-${Date.now()}`,
+          type: 'error',
+          message: e instanceof Error ? e.message : i18n.t('chat.startFailed'),
+          messageKey: e instanceof Error ? undefined : 'chat.startFailed',
+        });
+      }
     },
     [
       send,
@@ -663,7 +652,7 @@ export function useIPC() {
         console.log('[useIPC] Browser mode - no persistent trace steps');
         return [];
       }
-      return invoke<TraceStep[]>({ type: 'session.getTraceSteps', payload: { sessionId } });
+      return (await invoke<TraceStep[]>({ type: 'session.getTraceSteps', payload: { sessionId } })) || [];
     },
     [invoke]
   );

@@ -22,6 +22,8 @@ const PLATFORMS = {
 const BASE_URL = 'https://nodejs.org/dist';
 const OUTPUT_DIR = path.join(__dirname, '..', 'resources', 'node');
 const DOWNLOAD_ALL_PLATFORMS = process.env.OPEN_COWORK_DOWNLOAD_ALL_NODE_BINARIES === '1';
+const WINDOWS_UNLINK_RETRY_COUNT = 8;
+const WINDOWS_UNLINK_RETRY_DELAY_MS = 500;
 
 function download(url, dest) {
   return new Promise((resolve, reject) => {
@@ -46,6 +48,40 @@ function download(url, dest) {
       reject(err);
     });
   });
+}
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function removeFileWithRetries(filePath) {
+  if (!fs.existsSync(filePath)) {
+    return;
+  }
+
+  let lastError = null;
+  for (let attempt = 1; attempt <= WINDOWS_UNLINK_RETRY_COUNT; attempt += 1) {
+    try {
+      fs.unlinkSync(filePath);
+      return;
+    } catch (error) {
+      lastError = error;
+      const isRetryableWindowsError = process.platform === 'win32'
+        && (error.code === 'EPERM' || error.code === 'EBUSY' || error.code === 'ENOTEMPTY');
+      if (!isRetryableWindowsError || attempt === WINDOWS_UNLINK_RETRY_COUNT) {
+        throw error;
+      }
+
+      console.warn(
+        `[download:node] Failed to remove ${path.basename(filePath)} (attempt ${attempt}/${WINDOWS_UNLINK_RETRY_COUNT}): ${error.code}. Retrying...`
+      );
+      sleepSync(WINDOWS_UNLINK_RETRY_DELAY_MS);
+    }
+  }
+
+  if (lastError) {
+    throw lastError;
+  }
 }
 
 async function downloadAndExtract(platform, arch) {
@@ -107,13 +143,44 @@ async function downloadAndExtract(platform, arch) {
     }
 
     // Clean up archive
-    fs.unlinkSync(archivePath);
+    removeFileWithRetries(archivePath);
+
+    // Remove files not needed at runtime to reduce bundle size (~65MB savings)
+    const CLEANUP_DIRS = ['include', 'share'];
+    const CLEANUP_FILES = ['CHANGELOG.md', 'README.md'];
+    const CLEANUP_NPM_DIRS = ['docs', 'man'];
+
+    for (const dir of CLEANUP_DIRS) {
+      const dirPath = path.join(extractDir, dir);
+      if (fs.existsSync(dirPath)) {
+        fs.rmSync(dirPath, { recursive: true, force: true });
+        console.log(`  Removed ${dir}/`);
+      }
+    }
+    for (const file of CLEANUP_FILES) {
+      const filePath = path.join(extractDir, file);
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+        console.log(`  Removed ${file}`);
+      }
+    }
+    const npmDir = path.join(extractDir, 'lib', 'node_modules', 'npm');
+    if (fs.existsSync(npmDir)) {
+      for (const sub of CLEANUP_NPM_DIRS) {
+        const subPath = path.join(npmDir, sub);
+        if (fs.existsSync(subPath)) {
+          fs.rmSync(subPath, { recursive: true, force: true });
+          console.log(`  Removed npm/${sub}/`);
+        }
+      }
+    }
+
     console.log(`✓ Extracted: ${platform}-${arch}`);
   } catch (error) {
-    console.error(`✗ Failed to download ${platform}-${arch}:`, error.message);
+    console.error(`✗ Failed to download ${platform}-${arch}:`, error?.stack || error);
     // Clean up on error
     if (fs.existsSync(archivePath)) {
-      fs.unlinkSync(archivePath);
+      removeFileWithRetries(archivePath);
     }
     if (fs.existsSync(extractDir)) {
       fs.rmSync(extractDir, { recursive: true, force: true });

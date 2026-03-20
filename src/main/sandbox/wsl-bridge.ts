@@ -8,7 +8,7 @@
  * - Path conversion between Windows and WSL
  */
 
-import { spawn, exec, ChildProcess } from 'child_process';
+import { spawn, exec, execFile, ChildProcess } from 'child_process';
 import { promisify } from 'util';
 import { v4 as uuidv4 } from 'uuid';
 import * as path from 'path';
@@ -37,6 +37,11 @@ async function loadBootstrap() {
 }
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+
+function escapeForDoubleQuotes(s: string): string {
+  return s.replace(/[\\$`"!]/g, '\\$&');
+}
 
 /**
  * Path conversion utilities for Windows <-> WSL
@@ -91,6 +96,14 @@ export const pathConverter: PathConverter = {
  * WSL Bridge - Manages communication with WSL2
  */
 export class WSLBridge implements SandboxExecutor {
+  /** Validate WSL distro name to prevent command injection */
+  private static validateDistroName(distro: string): string {
+    if (!/^[a-zA-Z0-9\-_.]+$/.test(distro)) {
+      throw new Error(`Invalid WSL distro name: ${distro}`);
+    }
+    return distro;
+  }
+
   private wslProcess: ChildProcess | null = null;
   private pendingRequests: Map<string, {
     resolve: (value: unknown) => void;
@@ -177,6 +190,7 @@ export class WSLBridge implements SandboxExecutor {
       // Prefer Ubuntu, otherwise use first available
       const ubuntu = distros.find(d => d.toLowerCase().includes('ubuntu'));
       const selectedDistro = ubuntu || distros[0];
+      WSLBridge.validateDistroName(selectedDistro);
       log('[WSL] Selected distro:', selectedDistro);
 
       // Test if the distro actually works (WSL service might be broken)
@@ -299,6 +313,7 @@ export class WSLBridge implements SandboxExecutor {
    */
   static async testDistro(distro: string): Promise<boolean> {
     try {
+      WSLBridge.validateDistroName(distro);
       const { stdout } = await execAsync(`wsl -d ${distro} -e echo "OK"`, {
         timeout: 10000,
         encoding: 'utf-8',
@@ -382,22 +397,25 @@ export class WSLBridge implements SandboxExecutor {
     try {
       // Step 1: Install nvm
       log('[WSL] Step 1: Installing nvm...');
-      await execAsync(
-        `wsl -d ${distro} -e bash -c "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash"`,
+      await execFileAsync(
+        'wsl',
+        ['-d', distro, '-e', 'bash', '-c', 'curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash'],
         { timeout: 120000, encoding: 'utf-8' }
       );
-      
+
       // Step 2: Install node using nvm
       log('[WSL] Step 2: Installing Node.js 20 via nvm...');
-      await execAsync(
-        `wsl -d ${distro} -e bash -c "source ~/.nvm/nvm.sh && nvm install 20 && nvm alias default 20"`,
+      await execFileAsync(
+        'wsl',
+        ['-d', distro, '-e', 'bash', '-c', 'source ~/.nvm/nvm.sh && nvm install 20 && nvm alias default 20'],
         { timeout: 180000, encoding: 'utf-8' }
       );
 
       // Verify installation
       log('[WSL] Step 3: Verifying installation...');
-      const verifyResult = await execAsync(
-        `wsl -d ${distro} -e bash -c "source ~/.nvm/nvm.sh && node --version"`,
+      const verifyResult = await execFileAsync(
+        'wsl',
+        ['-d', distro, '-e', 'bash', '-c', 'source ~/.nvm/nvm.sh && node --version'],
         { timeout: 10000, encoding: 'utf-8' }
       );
       
@@ -479,6 +497,7 @@ export class WSLBridge implements SandboxExecutor {
    * Install Python packages commonly needed by skills (PDF, PPTX, etc.)
    */
   static async installSkillDependencies(distro: string): Promise<void> {
+    WSLBridge.validateDistroName(distro);
     log('[WSL] Installing skill dependencies (markitdown, pypdf, etc.)...');
     
     // These packages are required by the built-in PDF and PPTX skills
@@ -509,6 +528,7 @@ export class WSLBridge implements SandboxExecutor {
    * Install pip in WSL (when Python exists but pip doesn't)
    */
   static async installPipInWSL(distro: string): Promise<boolean> {
+    WSLBridge.validateDistroName(distro);
     log('[WSL] Installing pip in WSL...');
     
     try {
@@ -705,7 +725,7 @@ export class WSLBridge implements SandboxExecutor {
 
     // Start WSL process with the agent
     // Need to source nvm.sh first since node is installed via nvm
-    const nodeCommand = `source ~/.nvm/nvm.sh 2>/dev/null; node "${wslAgentPath}"`;
+    const nodeCommand = `source ~/.nvm/nvm.sh 2>/dev/null; node "${escapeForDoubleQuotes(wslAgentPath)}"`;
     log('[WSL] Agent command:', nodeCommand);
     
     this.wslProcess = spawn('wsl', [
@@ -716,9 +736,20 @@ export class WSLBridge implements SandboxExecutor {
     });
 
     // Handle stdout (JSON-RPC responses)
+    const MAX_BUFFER_SIZE = 10 * 1024 * 1024; // 10MB limit
     this.wslProcess.stdout?.on('data', (data: Buffer) => {
-      this.buffer += data.toString();
-      this.processBuffer();
+      try {
+        this.buffer += data.toString();
+        if (this.buffer.length > MAX_BUFFER_SIZE) {
+          logError('[WSL] Buffer size exceeded limit, disconnecting agent');
+          this.buffer = '';
+          this.wslProcess?.kill();
+          return;
+        }
+        this.processBuffer();
+      } catch (error) {
+        logError('[WSL] Error processing stdout data:', error);
+      }
     });
 
     // Handle stderr (logging)

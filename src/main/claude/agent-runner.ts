@@ -5,12 +5,12 @@
  *
  * Responsibilities:
  * - Runs AI conversations via the pi-coding-agent SDK (createAgentSession)
- * - Routes providers: Anthropic direct vs Python proxy for OpenAI/Gemini/OpenRouter
+ * - Routes providers via pi-ai SDK for model resolution
  * - Bridges MCP tools into SDK ToolDefinition format
  * - Streams responses back as ServerEvents (stream.message, stream.partial, trace.step)
  * - Skills injection, system prompt assembly, permission handling
  *
- * Dependencies: session-manager, mcp-manager, config-store, proxy-manager, skills-manager
+ * Dependencies: session-manager, mcp-manager, config-store, skills-manager
  */
 import {
   createAgentSession,
@@ -53,9 +53,22 @@ import {
 } from './pi-model-resolution';
 import { buildPiSessionRuntimeSignature } from './pi-session-runtime';
 import { ThinkTagStreamParser } from './think-tag-parser';
+import { fetchOllamaModelInfo } from '../config/ollama-api';
 
 // Virtual workspace path shown to the model (hides real sandbox path)
 const VIRTUAL_WORKSPACE_PATH = '/workspace';
+
+/**
+ * Estimate chars-per-token ratio based on content language.
+ * CJK characters tokenize at ~1.5 chars/token vs ~4 for English.
+ */
+function estimateCharsPerToken(sampleText: string): number {
+  if (!sampleText || sampleText.length === 0) return 4;
+  const sample = sampleText.substring(0, 500);
+  const cjkCount = (sample.match(/[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/g) || []).length;
+  const cjkRatio = cjkCount / sample.length;
+  return 4 - cjkRatio * 2.5; // Range: 1.5 (pure CJK) ~ 4 (pure English)
+}
 
 // Bundled node/npx paths never change at runtime — resolve once.
 let cachedBundledNodePaths: { node: string; npx: string } | null | undefined = undefined;
@@ -176,8 +189,9 @@ async function enrichProcessPathForBuild(): Promise<void> {
         shellPaths = output.split(':').filter((p: string) => p.trim());
         log(`[ClaudeAgentRunner] Restored ${shellPaths.length} paths from login shell`);
       }
-    } catch (err: any) {
-      logWarn(`[ClaudeAgentRunner] Could not restore shell PATH: ${err.message}`);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logWarn(`[ClaudeAgentRunner] Could not restore shell PATH: ${message}`);
     }
   } else if (platform === 'win32') {
     try {
@@ -189,8 +203,9 @@ async function enrichProcessPathForBuild(): Promise<void> {
         shellPaths = output.split(';').filter((p: string) => p.trim());
         log(`[ClaudeAgentRunner] Restored ${shellPaths.length} paths from Windows registry`);
       }
-    } catch (err: any) {
-      logWarn(`[ClaudeAgentRunner] Could not restore Windows PATH: ${err.message}`);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logWarn(`[ClaudeAgentRunner] Could not restore Windows PATH: ${message}`);
     }
   }
 
@@ -238,7 +253,7 @@ function buildMcpCustomTools(mcpManager: MCPManager): ToolDefinition[] {
   const mcpTools = mcpManager.getTools();
   return mcpTools.map((mcpTool) => {
     // Wrap the raw JSON Schema inputSchema as a TypeBox TSchema
-    const parameters = Type.Unsafe<Record<string, any>>(mcpTool.inputSchema as any);
+    const parameters = Type.Unsafe<Record<string, unknown>>(mcpTool.inputSchema as Record<string, unknown>);
 
     const toolDef: ToolDefinition<TSchema, unknown> = {
       name: mcpTool.name,
@@ -247,12 +262,14 @@ function buildMcpCustomTools(mcpManager: MCPManager): ToolDefinition[] {
       parameters,
       async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
         try {
-          const result = await mcpManager.callTool(mcpTool.name, params as Record<string, any>);
+          const result = await mcpManager.callTool(mcpTool.name, params as Record<string, unknown>);
           // MCP callTool returns { content: [...] } — extract text
           const textParts: string[] = [];
-          if (result?.content) {
-            for (const part of result.content) {
-              if (part.type === 'text') textParts.push(part.text);
+          const resultObj = result as Record<string, unknown>;
+          if (resultObj?.content) {
+            const contentArr = resultObj.content as Array<Record<string, unknown>>;
+            for (const part of contentArr) {
+              if (part.type === 'text') textParts.push(String(part.text));
               else textParts.push(JSON.stringify(part));
             }
           } else {
@@ -262,13 +279,9 @@ function buildMcpCustomTools(mcpManager: MCPManager): ToolDefinition[] {
             content: [{ type: 'text' as const, text: textParts.join('\n') }],
             details: undefined as unknown,
           };
-        } catch (err: any) {
-          const errMsg = err instanceof Error ? err.message : String(err);
+        } catch (err: unknown) {
           logError(`[ClaudeAgentRunner] MCP tool ${mcpTool.name} failed:`, err);
-          return {
-            content: [{ type: 'text' as const, text: `MCP tool error: ${errMsg}` }],
-            details: undefined as unknown,
-          };
+          throw err instanceof Error ? err : new Error(String(err));
         }
       },
     };
@@ -290,6 +303,34 @@ function safeStringify(value: unknown, space = 0): string {
   }
 }
 
+function summarizeMessageForLog(message: unknown): Record<string, unknown> {
+  if (!message || typeof message !== 'object') {
+    return { present: false };
+  }
+
+  const typedMessage = message as {
+    role?: unknown;
+    stopReason?: unknown;
+    content?: unknown[];
+    usage?: unknown;
+  };
+  const content = Array.isArray(typedMessage.content) ? typedMessage.content : [];
+
+  return {
+    present: true,
+    role: typeof typedMessage.role === 'string' ? typedMessage.role : undefined,
+    stopReason: typedMessage.stopReason ?? undefined,
+    contentBlocks: content.length,
+    contentTypes: content.slice(0, 8).map((block) => {
+      if (!block || typeof block !== 'object') {
+        return typeof block;
+      }
+      const type = (block as { type?: unknown }).type;
+      return typeof type === 'string' ? type : 'unknown';
+    }),
+    usage: normalizeTokenUsage(typedMessage.usage),
+  };
+}
 
 function toErrorText(error: unknown): string {
   if (error instanceof Error) {
@@ -348,10 +389,11 @@ interface CachedPiSession {
   modelId: string;
   thinkingLevel: string;
   runtimeSignature: string;
+  ollamaNumCtx?: { value: number };
 }
 
 /**
- * ClaudeAgentRunner - Uses @anthropic-ai/claude-agent-sdk with allowedTools
+ * ClaudeAgentRunner - Uses @mariozechner/pi-coding-agent SDK
  * 
  * Environment variables should be set before running:
  *   ANTHROPIC_BASE_URL=https://openrouter.ai/api
@@ -416,17 +458,19 @@ export class ClaudeAgentRunner {
       const apiCredentials = credentials.filter(c => c.type === 'api');
       const otherCredentials = credentials.filter(c => c.type === 'other');
 
-      // Format credentials with actual password for agent use
+      // Format credentials with masked password for system prompt.
+      // Credentials should be passed through a secure channel (e.g., MCP tool
+      // call or secure IPC), not embedded as plaintext in the prompt.
       const formatCredential = (c: UserCredential) => {
         const lines = [`- **${c.name}**${c.service ? ` (${c.service})` : ''}`];
         lines.push(`  - Username/Email: \`${c.username}\``);
-        lines.push(`  - Password: \`${c.password}\``);
+        lines.push(`  - Password: \`****\``);
         if (c.url) lines.push(`  - URL: ${c.url}`);
         if (c.notes) lines.push(`  - Notes: ${c.notes}`);
         return lines.join('\n');
       };
 
-      let sections: string[] = [];
+      const sections: string[] = [];
       
       if (emailCredentials.length > 0) {
         sections.push(`**Email Accounts (${emailCredentials.length}):**\n${emailCredentials.map(formatCredential).join('\n\n')}`);
@@ -827,6 +871,9 @@ ${hints.join('\n')}
       return content.replace(new RegExp(sandboxPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), VIRTUAL_WORKSPACE_PATH);
     };
 
+    const thinkingStepId = uuidv4();
+    let abortedByTimeout = false;
+
     try {
       this.pathResolver.registerSession(session.id, session.mountedPaths);
       logTiming('pathResolver.registerSession', runStartTime);
@@ -835,7 +882,6 @@ ${hints.join('\n')}
       // No need to send it again from backend
 
       // Send initial thinking trace
-      const thinkingStepId = uuidv4();
       this.sendTraceStep(session.id, {
         id: thinkingStepId,
         type: 'thinking',
@@ -977,7 +1023,7 @@ ${hints.join('\n')}
             payload: {
               sessionId: session.id,
               phase: 'error',
-              message: 'Sandbox sync failed',
+              message: 'Sandbox file sync failed, falling back to direct access mode',
               detail: 'Falling back to direct access mode (less secure)',
             },
           });
@@ -1110,7 +1156,7 @@ ${hints.join('\n')}
             payload: {
               sessionId: session.id,
               phase: 'error',
-              message: 'Sandbox sync failed',
+              message: 'Sandbox file sync failed, falling back to direct access mode',
               detail: 'Falling back to direct access mode (less secure)',
             },
           });
@@ -1125,7 +1171,7 @@ ${hints.join('\n')}
 
       logCtx('[ClaudeAgentRunner] Total messages:', existingMessages.length);
 
-      const hasImages = lastUserMessage?.content.some((c: any) => c.type === 'image') || false;
+      const hasImages = lastUserMessage?.content.some((c) => (c as { type?: string }).type === 'image') || false;
       if (hasImages) {
         log('[ClaudeAgentRunner] User message contains images');
       }
@@ -1139,6 +1185,7 @@ ${hints.join('\n')}
         runtimeConfig.provider,
         runtimeConfig.customProtocol,
       );
+      let usedSyntheticModel = false;
       let piModel = resolvePiRegistryModel(modelString, {
         configProvider: configProtocol,
         customBaseUrl: runtimeConfig.baseUrl?.trim() || undefined,
@@ -1147,6 +1194,7 @@ ${hints.join('\n')}
       });
 
       if (!piModel) {
+        usedSyntheticModel = true;
         // Synthetic fallback: construct a Model for unknown/custom models
         const synthetic = resolveSyntheticPiModelFallback({
           rawModel: runtimeConfig.model,
@@ -1177,15 +1225,39 @@ ${hints.join('\n')}
       }
       logCtx('[ClaudeAgentRunner] Resolved pi-ai model:', piModel.provider, piModel.id);
 
+      // For Ollama: query actual context window from /api/show if user hasn't configured one
+      const provider = runtimeConfig.provider || 'anthropic';
+      if (provider === 'ollama' && !runtimeConfig.contextWindow) {
+        const ollamaBaseUrl =
+          piModel.baseUrl || runtimeConfig.baseUrl || 'http://localhost:11434/v1';
+        const ollamaInfo = await fetchOllamaModelInfo({
+          baseUrl: ollamaBaseUrl,
+          model: piModel.id,
+          apiKey: runtimeConfig.apiKey,
+        });
+        if (ollamaInfo.contextWindow) {
+          log(
+            '[ClaudeAgentRunner] Ollama /api/show reported contextWindow:',
+            ollamaInfo.contextWindow,
+            '(was:',
+            piModel.contextWindow,
+            ')',
+          );
+          piModel = { ...piModel, contextWindow: ollamaInfo.contextWindow };
+        }
+      }
+
       // Send context window info to renderer for UI display
       this.sendToRenderer({
         type: 'session.contextInfo',
-        payload: { sessionId: session.id, contextWindow: piModel.contextWindow || 128000 },
+        payload: {
+          sessionId: session.id,
+          contextWindow: piModel.contextWindow || 128000,
+        },
       });
 
       // Set up API keys via AuthStorage
       const authStorage = getSharedAuthStorage();
-      const provider = runtimeConfig.provider || 'anthropic';
       const apiKey = runtimeConfig.apiKey?.trim();
       if (apiKey) {
         // Map our config provider to pi-ai provider name
@@ -1201,7 +1273,16 @@ ${hints.join('\n')}
         }
         log('[ClaudeAgentRunner] Set runtime API key for config provider:', piProvider);
       } else {
-        logWarn('[ClaudeAgentRunner] No API key configured for provider:', provider);
+        if (provider === 'ollama') {
+          log('[ClaudeAgentRunner] Ollama configured without explicit API key; relying on OpenAI-compatible placeholder/env auth path', safeStringify({
+            provider,
+            modelProvider: piModel.provider,
+            modelId: piModel.id,
+            baseUrl: piModel.baseUrl || runtimeConfig.baseUrl || '',
+          }));
+        } else {
+          logWarn('[ClaudeAgentRunner] No API key configured for provider:', provider);
+        }
       }
 
       // baseUrl is now embedded in the model object via resolvePiModel()
@@ -1250,7 +1331,7 @@ ${hints.join('\n')}
               } catch (err) {
                 // If symlink fails (e.g., on Windows without permissions), copy the directory
                 logWarn(`[ClaudeAgentRunner] Failed to symlink ${skillName}, copying instead:`, err);
-                // We'll skip copying for now to keep it simple
+                this.copyDirectorySync(builtinSkillPath, userSkillPath);
               }
             }
           }
@@ -1316,10 +1397,27 @@ ${hints.join('\n')}
           : conversationMessages;
 
         if (historyMessages.length > 0 && !hasImages) {
-          // Token-budget: ~4 chars/token, use ~30% of context window for history
+          // Content-aware chars-per-token estimation (CJK text uses ~1.5 chars/token vs ~4 for English)
           const contextWindow = piModel.contextWindow || 128000;
-          const historyTokenBudget = Math.floor(contextWindow * 0.3);
-          const historyCharBudget = historyTokenBudget * 4;
+          const historyBudgetRatio =
+            provider === 'ollama' && contextWindow < 16384 ? 0.15 : 0.3;
+          const historyTokenBudget = Math.floor(
+            contextWindow * historyBudgetRatio,
+          );
+
+          // Sample recent messages to estimate chars-per-token ratio
+          const sampleText = historyMessages
+            .slice(-3)
+            .flatMap((m) =>
+              m.content
+                .filter((c) => c.type === 'text')
+                .map((c) => (c as { text: string }).text),
+            )
+            .join('');
+          const charsPerToken = estimateCharsPerToken(sampleText);
+          const historyCharBudget = Math.floor(
+            historyTokenBudget * charsPerToken,
+          );
 
           const historyItems: string[] = [];
           let charCount = 0;
@@ -1327,10 +1425,11 @@ ${hints.join('\n')}
           for (let i = historyMessages.length - 1; i >= 0; i--) {
             const msg = historyMessages[i];
             const textContent = msg.content
-              .filter(c => c.type === 'text')
-              .map(c => (c as any).text)
+              .filter((c) => c.type === 'text')
+              .map((c) => (c as { text: string }).text)
               .join('\n');
-            const entry = `${msg.role === 'user' ? 'Human' : 'Assistant'}: ${textContent}`;
+            const roleTag = msg.role === 'user' ? 'user' : 'assistant';
+            const entry = `<turn role="${roleTag}">${textContent}</turn>`;
             if (charCount + entry.length > historyCharBudget) break;
             charCount += entry.length;
             historyItems.unshift(entry);
@@ -1338,11 +1437,25 @@ ${hints.join('\n')}
 
           if (historyItems.length > 0) {
             const trimmedCount = historyMessages.length - historyItems.length;
-            const preamble = trimmedCount > 0
-              ? `[Previous conversation - ${trimmedCount} older messages omitted]\n${historyItems.join('\n')}`
-              : historyItems.join('\n');
-            contextualPrompt = `${preamble}\nHuman: ${prompt}\nAssistant:`;
-            log('[ClaudeAgentRunner] Cold start: injecting', historyItems.length, 'of', historyMessages.length, 'history messages (budget:', historyCharBudget, 'chars, used:', charCount, ')');
+            const historyNote =
+              trimmedCount > 0
+                ? `[${trimmedCount} older messages omitted]\n`
+                : '';
+            const preamble = `<conversation_history>\n${historyNote}${historyItems.join('\n')}\n</conversation_history>`;
+            contextualPrompt = `${preamble}\n\n${prompt}`;
+            log(
+              '[ClaudeAgentRunner] Cold start: injecting',
+              historyItems.length,
+              'of',
+              historyMessages.length,
+              'history messages (budget:',
+              historyCharBudget,
+              'chars, used:',
+              charCount,
+              ', charsPerToken:',
+              charsPerToken.toFixed(2),
+              ')',
+            );
           }
         }
       } else {
@@ -1397,7 +1510,7 @@ ${hints.join('\n')}
                   : (config.command === 'node' && bundledNodePaths ? bundledNodePaths.node : config.command);
 
                 // 使用内置 npx/node 时，将内置 node bin 注入 PATH
-                let serverEnv = { ...config.env };
+                const serverEnv = { ...config.env };
                 if (bundledNodePaths && (config.command === 'npx' || config.command === 'node')) {
                   const nodeBinDir = path.dirname(bundledNodePaths.node);
                   const currentPath = process.env.PATH || '';
@@ -1571,6 +1684,15 @@ Tool routing:
           logCtx('[ClaudeAgentRunner] Model changed, hot-swapping:', cachedSession.modelId, '→', piModel.id);
           await piSession.setModel(piModel);
           cachedSession.modelId = piModel.id;
+          // Update Ollama num_ctx ref if present
+          if (cachedSession.ollamaNumCtx) {
+            cachedSession.ollamaNumCtx.value =
+              piModel.contextWindow || 128000;
+            log(
+              '[ClaudeAgentRunner] Updated Ollama num_ctx on hot-swap:',
+              cachedSession.ollamaNumCtx.value,
+            );
+          }
         }
         if (cachedSession.thinkingLevel !== thinkingLevel) {
           logCtx('[ClaudeAgentRunner] Thinking level changed, hot-swapping:', cachedSession.thinkingLevel, '→', thinkingLevel);
@@ -1593,6 +1715,36 @@ Tool routing:
 
         const modelRegistry = new ModelRegistry(authStorage);
 
+        // Ollama-specific compaction tuning based on actual context window
+        const contextWindow = piModel.contextWindow || 128000;
+        let compactionSettings: {
+          enabled: boolean;
+          reserveTokens?: number;
+          keepRecentTokens?: number;
+        };
+        if (provider === 'ollama' && contextWindow < 16384) {
+          // Very small context: disable compaction (weak models produce unreliable summaries)
+          compactionSettings = { enabled: false };
+          log(
+            '[ClaudeAgentRunner] Ollama small context model, disabling auto-compaction (contextWindow:',
+            contextWindow,
+            ')',
+          );
+        } else if (provider === 'ollama' && contextWindow < 65536) {
+          // Medium context: scale reserves proportionally
+          compactionSettings = {
+            enabled: true,
+            reserveTokens: Math.floor(contextWindow * 0.15),
+            keepRecentTokens: Math.floor(contextWindow * 0.25),
+          };
+          log(
+            '[ClaudeAgentRunner] Ollama medium context, scaled compaction:',
+            JSON.stringify(compactionSettings),
+          );
+        } else {
+          compactionSettings = { enabled: true };
+        }
+
         const { session: newPiSession } = await createAgentSession({
           model: piModel,
           thinkingLevel,
@@ -1602,7 +1754,7 @@ Tool routing:
           customTools: mcpCustomTools,
           sessionManager: PiSessionManager.inMemory(),
           settingsManager: PiSettingsManager.inMemory({
-            compaction: { enabled: true },
+            compaction: compactionSettings,
             retry: { enabled: true, maxRetries: 2 },
           }),
           resourceLoader,
@@ -1617,6 +1769,31 @@ Tool routing:
           thinkingLevel,
           runtimeSignature: sessionRuntimeSignature,
         });
+
+        // Ollama: wrap _onPayload to inject num_ctx into every request
+        if (provider === 'ollama') {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const agent = piSession.agent as any;
+          const originalOnPayload = agent._onPayload as
+            | ((payload: Record<string, unknown>, modelArg: unknown) => Promise<Record<string, unknown>>)
+            | undefined;
+          const ollamaNumCtx = {
+            value: piModel.contextWindow || 128000,
+          };
+          agent._onPayload = async (payload: Record<string, unknown>, modelArg: unknown) => {
+            let result = originalOnPayload
+              ? await originalOnPayload.call(agent, payload, modelArg)
+              : payload;
+            if (result === undefined) result = payload;
+            return { ...result, num_ctx: ollamaNumCtx.value };
+          };
+          this.piSessions.get(session.id)!.ollamaNumCtx = ollamaNumCtx;
+          log(
+            '[ClaudeAgentRunner] Ollama _onPayload wrapper installed, num_ctx:',
+            ollamaNumCtx.value,
+          );
+        }
+
         logTiming('pi-coding-agent session created', runStartTime);
       }
 
@@ -1625,7 +1802,50 @@ Tool routing:
       // Accumulate streamed text deltas in case message_end.content is empty (pi SDK streaming behaviour)
       let streamedText = '';
       let compactionStepId: string | undefined;
+      let hasEmittedError = false;
+      let terminalErrorText: string | undefined;
       const thinkParser = new ThinkTagStreamParser();
+      const promptStartedAt = Date.now();
+      const streamEventCounts = new Map<string, number>();
+
+      // Ollama cold-start feedback: if provider is 'ollama' and no stream event arrives
+      // within 10 seconds, show a "model loading" trace update so users know what's happening.
+      let ollamaColdStartTimerId: ReturnType<typeof setTimeout> | undefined;
+      let receivedFirstStreamEvent = false;
+      let firstStreamEventAt: number | undefined;
+      if (provider === 'ollama') {
+        ollamaColdStartTimerId = setTimeout(() => {
+          if (!receivedFirstStreamEvent && !controller.signal.aborted) {
+            this.sendTraceUpdate(session.id, thinkingStepId, {
+              title: 'Waiting for model to load into memory...',
+            });
+          }
+        }, 10000);
+      }
+
+      const markFirstStreamEvent = (eventType: string) => {
+        if (receivedFirstStreamEvent) {
+          return;
+        }
+        receivedFirstStreamEvent = true;
+        firstStreamEventAt = Date.now();
+        if (ollamaColdStartTimerId) {
+          clearTimeout(ollamaColdStartTimerId);
+        }
+        this.sendTraceUpdate(session.id, thinkingStepId, {
+          title: 'Processing request...',
+        });
+        if (provider === 'ollama') {
+          log('[ClaudeAgentRunner] Ollama first stream event received', safeStringify({
+            sessionId: session.id,
+            eventType,
+            modelId: piModel.id,
+            modelProvider: piModel.provider,
+            baseUrl: piModel.baseUrl || runtimeConfig.baseUrl || '',
+            latencyMs: firstStreamEventAt - promptStartedAt,
+          }));
+        }
+      };
 
       // Activity-based timeout: reset the 5-min timer whenever the SDK sends events
       const PROMPT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
@@ -1634,23 +1854,48 @@ Tool routing:
         if (activityTimeoutId) clearTimeout(activityTimeoutId);
         activityTimeoutId = setTimeout(() => {
           logWarn('[ClaudeAgentRunner] Prompt timed out (no activity for 5 min), aborting');
+          abortedByTimeout = true;
           controller.abort();
         }, PROMPT_TIMEOUT_MS);
       };
 
+      const recordStreamEvent = (eventType: string) => {
+        streamEventCounts.set(eventType, (streamEventCounts.get(eventType) ?? 0) + 1);
+      };
+
+      const getStreamEventSummary = () =>
+        Object.fromEntries(
+          Array.from(streamEventCounts.entries()).sort(([left], [right]) => left.localeCompare(right))
+        );
+
       const unsubscribe = piSession.subscribe((event) => {
+        try {
         if (controller.signal.aborted) return;
 
         // Reset activity timeout on meaningful events
         resetActivityTimeout();
 
-        // Debug: log every event type
         if (event.type === 'message_update') {
-          log(`[ClaudeAgentRunner] Event: ${event.type} → ${event.assistantMessageEvent.type}`);
-        } else if (event.type === 'message_start' || event.type === 'message_end') {
-          log(`[ClaudeAgentRunner] Event: ${event.type}`, JSON.stringify((event.message as any)?.content || 'no content').substring(0, 500));
+          const updateType = event.assistantMessageEvent.type;
+          recordStreamEvent(updateType);
+          if (updateType !== 'text_delta' && updateType !== 'thinking_delta') {
+            log(`[ClaudeAgentRunner] Event: ${event.type} → ${updateType}`);
+          }
+        } else if (event.type === 'message_start') {
+          log('[ClaudeAgentRunner] Event: message_start', safeStringify(summarizeMessageForLog(event.message), 2));
+        } else if (event.type === 'message_end') {
+          log(
+            '[ClaudeAgentRunner] Event: message_end',
+            safeStringify(
+              {
+                message: summarizeMessageForLog(event.message),
+                messageUpdateCounts: getStreamEventSummary(),
+              },
+              2
+            )
+          );
         } else if (event.type === 'turn_end') {
-          log(`[ClaudeAgentRunner] Event: ${event.type}`, JSON.stringify((event.message as any)?.content || 'no content').substring(0, 500));
+          log(`[ClaudeAgentRunner] Event: ${event.type}`);
         } else {
           log(`[ClaudeAgentRunner] Event: ${event.type}`);
         }
@@ -1660,6 +1905,7 @@ Tool routing:
             if (controller.signal.aborted) break;
             const ame = event.assistantMessageEvent;
             if (ame.type === 'text_delta') {
+              markFirstStreamEvent(ame.type);
               const parsed = thinkParser.push(ame.delta);
               if (parsed.thinking) {
                 this.sendToRenderer({
@@ -1672,12 +1918,14 @@ Tool routing:
                 this.sendPartial(session.id, parsed.text);
               }
             } else if (ame.type === 'thinking_delta') {
+              markFirstStreamEvent(ame.type);
               // Forward thinking delta to renderer for real-time display
               this.sendToRenderer({
                 type: 'stream.thinking',
                 payload: { sessionId: session.id, delta: ame.delta },
               });
             } else if (ame.type === 'toolcall_start') {
+              markFirstStreamEvent(ame.type);
               const partial = ame.partial;
               const toolContent = partial?.content?.[ame.contentIndex];
               const toolName = toolContent?.type === 'toolCall' ? toolContent.name : 'unknown';
@@ -1721,30 +1969,51 @@ Tool routing:
             }
 
             const msg = event.message;
-            log(
-              '[ClaudeAgentRunner] message_end raw message:',
-              safeStringify(msg, 2)
-            );
+            if (process.env.COWORK_LOG_SDK_MESSAGES_FULL === '1') {
+              log(
+                '[ClaudeAgentRunner] message_end raw message:',
+                safeStringify(msg, 2)
+              );
+            }
             const resolvedPayload = resolveMessageEndPayload({
-              message: msg as any,
+              message: msg as Parameters<typeof resolveMessageEndPayload>[0]['message'],
               streamedText,
             });
             streamedText = resolvedPayload.nextStreamedText;
-            if (resolvedPayload.errorText) {
-              this.sendMessage(session.id, {
-                id: uuidv4(),
+            if (provider === 'ollama') {
+              log('[ClaudeAgentRunner] Ollama message_end diagnostics', safeStringify({
                 sessionId: session.id,
-                role: 'assistant',
-                content: [{
-                  type: 'text',
-                  text: `**Error**: ${resolvedPayload.errorText}\n\n${
-                    /\b4\d{2}\b/.test(resolvedPayload.errorText)
-                      ? '_请检查配置后重试。_'
-                      : '_Agent is still running and may retry..._'
-                  }`,
-                }],
-                timestamp: Date.now(),
-              });
+                modelId: piModel.id,
+                modelProvider: piModel.provider,
+                usedSyntheticModel,
+                receivedFirstStreamEvent,
+                firstStreamLatencyMs: firstStreamEventAt ? firstStreamEventAt - promptStartedAt : null,
+                stopReason: (msg as { stopReason?: unknown })?.stopReason ?? null,
+                contentBlocks: Array.isArray((msg as { content?: unknown[] })?.content)
+                  ? ((msg as { content?: unknown[] }).content?.length ?? 0)
+                  : 0,
+                emittedError: Boolean(resolvedPayload.errorText),
+              }));
+            }
+            if (resolvedPayload.errorText) {
+              terminalErrorText = resolvedPayload.errorText;
+              if (!hasEmittedError) {
+                hasEmittedError = true;
+                this.sendMessage(session.id, {
+                  id: uuidv4(),
+                  sessionId: session.id,
+                  role: 'assistant',
+                  content: [{
+                    type: 'text',
+                    text: `**Error**: ${resolvedPayload.errorText}\n\n${
+                      /\b4\d{2}\b/.test(resolvedPayload.errorText)
+                        ? '_请检查配置后重试。_'
+                        : '_Agent 正在自动重试，请稍候..._'
+                    }`,
+                  }],
+                  timestamp: Date.now(),
+                });
+              }
               break;
             }
             if (resolvedPayload.shouldEmitMessage) {
@@ -1775,8 +2044,9 @@ Tool routing:
                   });
                 } else {
                   // Unknown block type — pass through as text so content isn't silently lost
-                  log(`[ClaudeAgentRunner] Unknown content block type: ${(block as any).type}`);
-                  const text = (block as any).text || JSON.stringify(block);
+                  const unknownBlock = block as { type?: string; text?: string };
+                  log(`[ClaudeAgentRunner] Unknown content block type: ${unknownBlock.type}`);
+                  const text = unknownBlock.text || JSON.stringify(block);
                   if (text) contentBlocks.push({ type: 'text', text });
                 }
               }
@@ -1786,13 +2056,14 @@ Tool routing:
                 payload: { sessionId: session.id, delta: '' },
               });
               if (contentBlocks.length > 0) {
-                const tokenUsage = normalizeTokenUsage((msg as any).usage);
-                if ((msg as any).usage) {
+                const msgWithUsage = msg as { usage?: unknown };
+                const tokenUsage = normalizeTokenUsage(msgWithUsage.usage);
+                if (msgWithUsage.usage) {
                   log(
                     '[ClaudeAgentRunner] normalized usage:',
                     safeStringify(
                       {
-                        raw: (msg as any).usage,
+                        raw: msgWithUsage.usage,
                         normalized: tokenUsage,
                       },
                       2
@@ -1871,8 +2142,8 @@ Tool routing:
             const title = event.aborted
               ? 'Context compaction aborted'
               : event.errorMessage
-                ? `Compaction error: ${event.errorMessage}`
-                : 'Context compacted successfully';
+                ? `Context compaction failed: ${event.errorMessage}`
+                : 'Context compaction completed';
             log('[ClaudeAgentRunner] Auto-compaction ended:', title, 'willRetry:', event.willRetry);
             if (compactionStepId) {
               this.sendTraceUpdate(session.id, compactionStepId, { status, title });
@@ -1890,16 +2161,49 @@ Tool routing:
             break;
           }
         }
+        } catch (subscribeErr) {
+          logError('[ClaudeAgentRunner] Error in subscribe callback:', subscribeErr);
+          if (compactionStepId) {
+            this.sendTraceUpdate(session.id, compactionStepId, {
+              status: 'error',
+              title: 'Error during context compaction',
+            });
+            compactionStepId = undefined;
+          }
+          if (!hasEmittedError) {
+            hasEmittedError = true;
+            const errorText = toUserFacingErrorText(toErrorText(subscribeErr));
+            this.sendMessage(session.id, {
+              id: uuidv4(),
+              sessionId: session.id,
+              role: 'assistant',
+              content: [{ type: 'text', text: `**Error**: ${errorText}` }],
+              timestamp: Date.now(),
+            });
+          }
+        }
       });
 
       // Execute the prompt with activity-based timeout
       try {
         resetActivityTimeout();
+        if (provider === 'ollama') {
+          log('[ClaudeAgentRunner] Starting Ollama prompt', safeStringify({
+            sessionId: session.id,
+            modelId: piModel.id,
+            modelProvider: piModel.provider,
+            baseUrl: piModel.baseUrl || runtimeConfig.baseUrl || '',
+            usedSyntheticModel,
+            hasExplicitApiKey: Boolean(apiKey),
+            thinkingLevel,
+          }));
+        }
         try {
           const promptResult = await piSession.prompt(contextualPrompt);
           log('[ClaudeAgentRunner] prompt() returned:', JSON.stringify(promptResult ?? 'void').substring(0, 1000));
         } finally {
           if (activityTimeoutId) clearTimeout(activityTimeoutId);
+          if (ollamaColdStartTimerId) clearTimeout(ollamaColdStartTimerId);
         }
       } finally {
         try { unsubscribe(); } catch (e) { logWarn('[ClaudeAgentRunner] unsubscribe error:', e); }
@@ -1907,15 +2211,52 @@ Tool routing:
 
       logTiming('pi-coding-agent prompt completed', runStartTime);
 
-      // Complete - update the initial thinking step
-      this.sendTraceUpdate(session.id, thinkingStepId, {
-        status: 'completed',
-        title: 'Task completed',
-      });
+      // If the SDK swallowed the AbortError and returned void, detect timeout here
+      if (controller.signal.aborted && abortedByTimeout) {
+        logCtx('[ClaudeAgentRunner] Aborted due to timeout (detected after prompt returned)');
+        const errorMsg: Message = {
+          id: uuidv4(),
+          sessionId: session.id,
+          role: 'assistant',
+          content: [{ type: 'text', text: '**请求超时**：长时间未收到响应，操作已中止。' }],
+          timestamp: Date.now(),
+        };
+        this.sendMessage(session.id, errorMsg);
+        this.sendTraceUpdate(session.id, thinkingStepId, {
+          status: 'error',
+          title: 'Request timed out',
+        });
+      } else {
+        // Complete - update the initial thinking step
+        this.sendTraceUpdate(session.id, thinkingStepId, {
+          status: terminalErrorText ? 'error' : 'completed',
+          title: terminalErrorText ? 'Request failed' : 'Task completed',
+        });
+      }
 
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
-        logCtx('[ClaudeAgentRunner] Aborted');
+        if (abortedByTimeout) {
+          logCtx('[ClaudeAgentRunner] Aborted due to timeout');
+          const errorMsg: Message = {
+            id: uuidv4(),
+            sessionId: session.id,
+            role: 'assistant',
+            content: [{ type: 'text', text: '**请求超时**：长时间未收到响应，操作已中止。' }],
+            timestamp: Date.now(),
+          };
+          this.sendMessage(session.id, errorMsg);
+          this.sendTraceUpdate(session.id, thinkingStepId, {
+            status: 'error',
+            title: 'Request timed out',
+          });
+        } else {
+          logCtx('[ClaudeAgentRunner] Aborted by user');
+          this.sendTraceUpdate(session.id, thinkingStepId, {
+            status: 'completed',
+            title: 'Cancelled',
+          });
+        }
       } else {
         logCtxError('[ClaudeAgentRunner] Error:', error);
 
@@ -1939,7 +2280,7 @@ Tool routing:
 
         // Mark so session-manager doesn't report again
         if (error instanceof Error) {
-          (error as any).alreadyReportedToUser = true;
+          (error as Error & { alreadyReportedToUser?: boolean }).alreadyReportedToUser = true;
         }
       }
     } finally {
@@ -1948,25 +2289,36 @@ Tool routing:
 
       // Sync changes from sandbox back to host OS (but don't cleanup - sandbox persists)
       if (useSandboxIsolation && sandboxPath) {
-        const sandbox = getSandboxAdapter();
+        try {
+          const sandbox = getSandboxAdapter();
 
-        if (sandbox.isWSL) {
-          log('[ClaudeAgentRunner] Syncing sandbox changes to Windows...');
-          const syncResult = await SandboxSync.syncToWindows(session.id);
-          if (syncResult.success) {
-            log('[ClaudeAgentRunner] Sync completed successfully');
-          } else {
-            logError('[ClaudeAgentRunner] Sync failed:', syncResult.error);
+          if (sandbox.isWSL) {
+            log('[ClaudeAgentRunner] Syncing sandbox changes to Windows...');
+            const syncResult = await SandboxSync.syncToWindows(session.id);
+            if (syncResult.success) {
+              log('[ClaudeAgentRunner] Sync completed successfully');
+            } else {
+              logError('[ClaudeAgentRunner] Sync failed:', syncResult.error);
+            }
+          } else if (sandbox.isLima) {
+            log('[ClaudeAgentRunner] Syncing sandbox changes to macOS...');
+            const { LimaSync } = await import('../sandbox/lima-sync');
+            const syncResult = await LimaSync.syncToMac(session.id);
+            if (syncResult.success) {
+              log('[ClaudeAgentRunner] Sync completed successfully');
+            } else {
+              logError('[ClaudeAgentRunner] Sync failed:', syncResult.error);
+            }
           }
-        } else if (sandbox.isLima) {
-          log('[ClaudeAgentRunner] Syncing sandbox changes to macOS...');
-          const { LimaSync } = await import('../sandbox/lima-sync');
-          const syncResult = await LimaSync.syncToMac(session.id);
-          if (syncResult.success) {
-            log('[ClaudeAgentRunner] Sync completed successfully');
-          } else {
-            logError('[ClaudeAgentRunner] Sync failed:', syncResult.error);
-          }
+        } catch (syncErr) {
+          logError('[ClaudeAgentRunner] Sandbox sync error:', syncErr);
+          this.sendMessage(session.id, {
+            id: uuidv4(),
+            sessionId: session.id,
+            role: 'assistant',
+            content: [{ type: 'text', text: `**Warning**: Sandbox sync failed: ${syncErr instanceof Error ? syncErr.message : String(syncErr)}` }],
+            timestamp: Date.now(),
+          });
         }
       }
     }

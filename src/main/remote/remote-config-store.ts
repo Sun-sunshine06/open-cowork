@@ -4,7 +4,11 @@
  */
 
 import Store from 'electron-store';
-import { log } from '../utils/logger';
+import { log, logWarn } from '../utils/logger';
+import {
+  createEncryptedStoreWithKeyRotation,
+  getLegacyDerivedKeyHexes,
+} from '../utils/store-encryption';
 import type {
   RemoteConfig,
   GatewayConfig,
@@ -19,19 +23,34 @@ import { DEFAULT_REMOTE_CONFIG } from './types';
 
 class RemoteConfigStore {
   private store: Store<RemoteConfig & { pairedUsers: PairedUser[] }>;
-  
+ 
   constructor() {
-    const storeOptions: any = {
-      name: 'remote-config',
-      projectName: 'open-cowork',
-      defaults: {
-        ...DEFAULT_REMOTE_CONFIG,
-        pairedUsers: [],
+    // Cast to satisfy the Record<string, unknown> constraint of the encrypted store utility;
+    // RemoteConfig & { pairedUsers: PairedUser[] } is structurally compatible at runtime.
+    type RemoteConfigRecord = RemoteConfig & { pairedUsers: PairedUser[] } & Record<string, unknown>;
+    this.store = createEncryptedStoreWithKeyRotation<RemoteConfigRecord>({
+      stableKey: 'open-cowork-remote-stable-v1',
+      legacyKeys: [
+        'open-cowork-remote-v1',
+        ...getLegacyDerivedKeyHexes({
+          moduleDirname: __dirname,
+          stableSeed: 'open-cowork-remote-stable-v1',
+          legacySeed: 'open-cowork-remote-v1',
+          salt: 'open-cowork-remote-salt',
+        }),
+      ],
+      storeOptions: {
+        name: 'remote-config',
+        projectName: 'open-cowork',
+        defaults: {
+          ...DEFAULT_REMOTE_CONFIG,
+          pairedUsers: [],
+        },
       },
-      encryptionKey: 'open-cowork-remote-v1',
-    };
-
-    this.store = new Store<RemoteConfig & { pairedUsers: PairedUser[] }>(storeOptions);
+      logPrefix: '[RemoteConfigStore]',
+      log,
+      warn: logWarn,
+    }) as unknown as Store<RemoteConfig & { pairedUsers: PairedUser[] }>;
     
     // Migrate: change pairing mode to allowlist (allow everyone by default)
     this.migrateAuthMode();
@@ -70,11 +89,22 @@ class RemoteConfigStore {
   }
   
   /**
+   * Filter prototype pollution keys from user-controlled objects
+   */
+  private filterProtoPollution(obj: Record<string, unknown>): Record<string, unknown> {
+    const filtered = { ...obj };
+    delete filtered['__proto__'];
+    delete filtered['constructor'];
+    delete filtered['prototype'];
+    return filtered;
+  }
+
+  /**
    * Update gateway config
    */
   setGatewayConfig(config: Partial<GatewayConfig>): void {
     const current = this.getGatewayConfig();
-    this.store.set('gateway', { ...current, ...config });
+    this.store.set('gateway', { ...current, ...this.filterProtoPollution(config as Record<string, unknown>) });
     log('[RemoteConfig] Gateway config updated');
   }
   

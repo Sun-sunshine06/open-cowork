@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAppStore } from '../store';
 import type {
@@ -17,7 +17,6 @@ import { isLoopbackBaseUrl } from '../../shared/network/loopback';
 import {
   DEFAULT_OLLAMA_BASE_URL,
   normalizeOllamaBaseUrl,
-  shouldAutoDiscoverLocalOllamaBaseUrl,
 } from '../../shared/ollama-base-url';
 import { API_PROVIDER_PRESETS, getModelInputGuidance } from '../../shared/api-model-presets';
 import {
@@ -193,11 +192,11 @@ function defaultProfileForKey(
   presets: ProviderPresets
 ): UIProviderProfile {
   const preset = modelPresetForProfile(profileKey, presets);
-  const prefersCustomInput = profileKey.startsWith('custom:') || profileKey === 'ollama';
+  const prefersCustomInput = profileKey.startsWith('custom:');
   return {
     apiKey: '',
     baseUrl: preset.baseUrl,
-    model: preset.models[0]?.id || '',
+    model: profileKey === 'ollama' ? '' : (preset.models[0]?.id || ''),
     customModel: '',
     useCustomModel: prefersCustomInput,
     contextWindow: '',
@@ -212,16 +211,13 @@ function normalizeDiscoveredOllamaModels(models: string[] | undefined): Provider
     .map((id) => ({ id, name: id }));
 }
 
+// Inline helper: produces a partial discoveredModels update that clears a profile key.
+// Used by dispatch callers instead of calling this as a free function.
 function clearDiscoveredModelsForProfile(
-  setDiscoveredModels: Dispatch<
-    SetStateAction<Partial<Record<ProviderProfileKey, ProviderModelInfo[]>>>
-  >,
+  prev: Partial<Record<ProviderProfileKey, ProviderModelInfo[]>>,
   profileKey: ProviderProfileKey
-): void {
-  setDiscoveredModels((prev) => ({
-    ...prev,
-    [profileKey]: [],
-  }));
+): Partial<Record<ProviderProfileKey, ProviderModelInfo[]>> {
+  return { ...prev, [profileKey]: [] };
 }
 
 function isPristineCustomProfile(
@@ -494,23 +490,23 @@ function translateApiConfigErrorMessage(
   message: string,
   t: ReturnType<typeof useTranslation>['t']
 ): string {
-  if (message === '配置方案名称不能为空') {
+  if (message === 'Config set name is required') {
     return t('api.configSetNameRequired');
   }
-  if (message === '找不到可复制的配置方案') {
+  if (message === 'Config set clone source not found') {
     return t('api.configSetCloneSourceMissing');
   }
-  if (message === '配置方案不存在') {
+  if (message === 'Config set not found') {
     return t('api.configSetMissing');
   }
-  if (message === '默认方案不可删除') {
+  if (message === 'System config set cannot be deleted') {
     return t('api.configSetSystemDeleteForbidden');
   }
-  if (message === '至少需要保留一个配置方案') {
+  if (message === 'At least one config set must be kept') {
     return t('api.configSetKeepOne');
   }
 
-  const limitMatch = message.match(/^最多只能保存\s+(\d+)\s+个配置方案$/);
+  const limitMatch = message.match(/^Config set limit reached: max\s+(\d+)$/);
   if (limitMatch) {
     return t('api.configSetLimitReached', { count: Number(limitMatch[1]) });
   }
@@ -556,6 +552,260 @@ function buildSetupModelState(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Reducer state
+// ---------------------------------------------------------------------------
+
+interface ApiConfigState {
+  // Provider presets loaded from Electron
+  presets: ProviderPresets;
+  // Per-profile UI fields
+  profiles: Record<ProviderProfileKey, UIProviderProfile>;
+  // Which profile tab is selected
+  activeProfileKey: ProviderProfileKey;
+  // Config-set list and selection
+  configSets: ApiConfigSet[];
+  activeConfigSetId: string;
+  // Deferred action waiting for unsaved-changes resolution
+  pendingConfigSetAction: PendingConfigSetAction | null;
+  // Extended thinking flag
+  enableThinking: boolean;
+  // Remember last custom protocol so switching back to custom restores it
+  lastCustomProtocol: CustomProtocolType;
+  // Signature of the last persisted state (used for dirty-check)
+  savedDraftSignature: string;
+  // Ollama model discovery results keyed by profile
+  discoveredModels: Partial<Record<ProviderProfileKey, ProviderModelInfo[]>>;
+  // Async loading flags
+  isLoadingConfig: boolean;
+  isSaving: boolean;
+  isTesting: boolean;
+  isRefreshingModels: boolean;
+  isDiscoveringLocalOllama: boolean;
+  isMutatingConfigSet: boolean;
+  isDiagnosing: boolean;
+  // Error message — either a raw string or a i18n key + optional values
+  errorText: string;
+  errorKey: string | null;
+  errorValues: Record<string, string | number> | undefined;
+  // Success message — same dual-source pattern
+  successText: string;
+  successKey: string | null;
+  successValues: Record<string, string | number> | undefined;
+  // Persisted results
+  lastSaveCompletedAt: number;
+  testResult: ApiTestResult | null;
+  diagnosticResult: DiagnosticResult | null;
+}
+
+// ---------------------------------------------------------------------------
+// Actions (discriminated union — no plain string payloads where avoidable)
+// ---------------------------------------------------------------------------
+
+type ApiConfigAction =
+  // Bulk resets from loaded config
+  | {
+      type: 'APPLY_LOADED_STATE';
+      payload: {
+        presets: ProviderPresets;
+        profiles: Record<ProviderProfileKey, UIProviderProfile>;
+        activeProfileKey: ProviderProfileKey;
+        enableThinking: boolean;
+        configSets: ApiConfigSet[];
+        activeConfigSetId: string;
+        lastCustomProtocol: CustomProtocolType;
+        savedDraftSignature: string;
+      };
+    }
+  // Active profile key
+  | { type: 'SET_ACTIVE_PROFILE_KEY'; payload: ProviderProfileKey }
+  // Enable thinking toggle
+  | { type: 'SET_ENABLE_THINKING'; payload: boolean }
+  // Patch one profile in the profiles map
+  | { type: 'PATCH_PROFILE'; profileKey: ProviderProfileKey; patch: Partial<UIProviderProfile> }
+  // Replace a profile using a functional updater
+  | {
+      type: 'UPDATE_PROFILE_FN';
+      profileKey: ProviderProfileKey;
+      updater: (prev: UIProviderProfile) => UIProviderProfile;
+    }
+  // Discovered Ollama models
+  | {
+      type: 'SET_DISCOVERED_MODELS';
+      profileKey: ProviderProfileKey;
+      models: ProviderModelInfo[];
+    }
+  | { type: 'CLEAR_DISCOVERED_MODELS'; profileKey: ProviderProfileKey }
+  | { type: 'DELETE_DISCOVERED_MODELS'; profileKey: ProviderProfileKey }
+  // Config set mutations
+  | { type: 'SET_CONFIG_SETS'; payload: ApiConfigSet[] }
+  | { type: 'SET_ACTIVE_CONFIG_SET_ID'; payload: string }
+  | { type: 'SET_PENDING_CONFIG_SET_ACTION'; payload: PendingConfigSetAction | null }
+  // Loading flags
+  | { type: 'SET_IS_LOADING_CONFIG'; payload: boolean }
+  | { type: 'SET_IS_SAVING'; payload: boolean }
+  | { type: 'SET_IS_TESTING'; payload: boolean }
+  | { type: 'SET_IS_REFRESHING_MODELS'; payload: boolean }
+  | { type: 'SET_IS_DISCOVERING_LOCAL_OLLAMA'; payload: boolean }
+  | { type: 'SET_IS_MUTATING_CONFIG_SET'; payload: boolean }
+  | { type: 'SET_IS_DIAGNOSING'; payload: boolean }
+  // Error message helpers
+  | { type: 'CLEAR_ERROR' }
+  | { type: 'SET_ERROR_KEY'; key: string; values?: Record<string, string | number> }
+  | { type: 'SET_ERROR_TEXT'; text: string }
+  // Success message helpers
+  | { type: 'CLEAR_SUCCESS' }
+  | { type: 'SET_SUCCESS_KEY'; key: string; values?: Record<string, string | number> }
+  | { type: 'SET_SUCCESS_TEXT'; text: string }
+  // Results
+  | { type: 'SET_LAST_SAVE_COMPLETED_AT'; payload: number }
+  | { type: 'SET_TEST_RESULT'; payload: ApiTestResult | null }
+  | { type: 'SET_DIAGNOSTIC_RESULT'; payload: DiagnosticResult | null }
+  // Save signature
+  | { type: 'SET_SAVED_DRAFT_SIGNATURE'; payload: string }
+  // Last custom protocol memory
+  | { type: 'SET_LAST_CUSTOM_PROTOCOL'; payload: CustomProtocolType };
+
+// ---------------------------------------------------------------------------
+// Reducer
+// ---------------------------------------------------------------------------
+
+function apiConfigReducer(state: ApiConfigState, action: ApiConfigAction): ApiConfigState {
+  switch (action.type) {
+    case 'APPLY_LOADED_STATE':
+      return {
+        ...state,
+        presets: action.payload.presets,
+        profiles: action.payload.profiles,
+        activeProfileKey: action.payload.activeProfileKey,
+        enableThinking: action.payload.enableThinking,
+        configSets: action.payload.configSets,
+        activeConfigSetId: action.payload.activeConfigSetId,
+        pendingConfigSetAction: null,
+        lastCustomProtocol: action.payload.lastCustomProtocol,
+        savedDraftSignature: action.payload.savedDraftSignature,
+      };
+
+    case 'SET_ACTIVE_PROFILE_KEY':
+      return { ...state, activeProfileKey: action.payload };
+
+    case 'SET_ENABLE_THINKING':
+      return { ...state, enableThinking: action.payload };
+
+    case 'PATCH_PROFILE':
+      return {
+        ...state,
+        profiles: {
+          ...state.profiles,
+          [action.profileKey]: {
+            ...(state.profiles[action.profileKey] ||
+              defaultProfileForKey(action.profileKey, state.presets)),
+            ...action.patch,
+          },
+        },
+      };
+
+    case 'UPDATE_PROFILE_FN':
+      return {
+        ...state,
+        profiles: {
+          ...state.profiles,
+          [action.profileKey]: action.updater(
+            state.profiles[action.profileKey] ||
+              defaultProfileForKey(action.profileKey, state.presets)
+          ),
+        },
+      };
+
+    case 'SET_DISCOVERED_MODELS':
+      return {
+        ...state,
+        discoveredModels: { ...state.discoveredModels, [action.profileKey]: action.models },
+      };
+
+    case 'CLEAR_DISCOVERED_MODELS':
+      return {
+        ...state,
+        discoveredModels: clearDiscoveredModelsForProfile(state.discoveredModels, action.profileKey),
+      };
+
+    case 'DELETE_DISCOVERED_MODELS': {
+      const next = { ...state.discoveredModels };
+      delete next[action.profileKey];
+      return { ...state, discoveredModels: next };
+    }
+
+    case 'SET_CONFIG_SETS':
+      return { ...state, configSets: action.payload };
+
+    case 'SET_ACTIVE_CONFIG_SET_ID':
+      return { ...state, activeConfigSetId: action.payload };
+
+    case 'SET_PENDING_CONFIG_SET_ACTION':
+      return { ...state, pendingConfigSetAction: action.payload };
+
+    case 'SET_IS_LOADING_CONFIG':
+      return { ...state, isLoadingConfig: action.payload };
+
+    case 'SET_IS_SAVING':
+      return { ...state, isSaving: action.payload };
+
+    case 'SET_IS_TESTING':
+      return { ...state, isTesting: action.payload };
+
+    case 'SET_IS_REFRESHING_MODELS':
+      return { ...state, isRefreshingModels: action.payload };
+
+    case 'SET_IS_DISCOVERING_LOCAL_OLLAMA':
+      return { ...state, isDiscoveringLocalOllama: action.payload };
+
+    case 'SET_IS_MUTATING_CONFIG_SET':
+      return { ...state, isMutatingConfigSet: action.payload };
+
+    case 'SET_IS_DIAGNOSING':
+      return { ...state, isDiagnosing: action.payload };
+
+    case 'CLEAR_ERROR':
+      return { ...state, errorText: '', errorKey: null, errorValues: undefined };
+
+    case 'SET_ERROR_KEY':
+      return { ...state, errorText: '', errorKey: action.key, errorValues: action.values };
+
+    case 'SET_ERROR_TEXT':
+      return { ...state, errorKey: null, errorValues: undefined, errorText: action.text };
+
+    case 'CLEAR_SUCCESS':
+      return { ...state, successText: '', successKey: null, successValues: undefined };
+
+    case 'SET_SUCCESS_KEY':
+      return { ...state, successText: '', successKey: action.key, successValues: action.values };
+
+    case 'SET_SUCCESS_TEXT':
+      return { ...state, successKey: null, successValues: undefined, successText: action.text };
+
+    case 'SET_LAST_SAVE_COMPLETED_AT':
+      return { ...state, lastSaveCompletedAt: action.payload };
+
+    case 'SET_TEST_RESULT':
+      return { ...state, testResult: action.payload };
+
+    case 'SET_DIAGNOSTIC_RESULT':
+      return { ...state, diagnosticResult: action.payload };
+
+    case 'SET_SAVED_DRAFT_SIGNATURE':
+      return { ...state, savedDraftSignature: action.payload };
+
+    case 'SET_LAST_CUSTOM_PROTOCOL':
+      return { ...state, lastCustomProtocol: action.payload };
+
+    default: {
+      // Exhaustiveness check — TypeScript will error if a case is missing
+      const _exhaustive: never = action;
+      return _exhaustive;
+    }
+  }
+}
+
 export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
   const { t } = useTranslation();
   const { enabled = true, initialConfig, onSave } = options;
@@ -567,55 +817,72 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
   }
   const initialBootstrap = initialBootstrapRef.current;
 
-  const [presets, setPresets] = useState<ProviderPresets>(FALLBACK_PROVIDER_PRESETS);
-  const [profiles, setProfiles] = useState<Record<ProviderProfileKey, UIProviderProfile>>(
-    () => initialBootstrap.snapshot.profiles
-  );
-  const [activeProfileKey, setActiveProfileKey] = useState<ProviderProfileKey>(
-    () => initialBootstrap.snapshot.activeProfileKey
-  );
-
-  const [configSets, setConfigSets] = useState<ApiConfigSet[]>(() => initialBootstrap.configSets);
-  const [activeConfigSetId, setActiveConfigSetId] = useState<string>(
-    () => initialBootstrap.activeConfigSetId
-  );
-  const [pendingConfigSetAction, setPendingConfigSetAction] =
-    useState<PendingConfigSetAction | null>(null);
-  const [isMutatingConfigSet, setIsMutatingConfigSet] = useState(false);
-
-  const [lastCustomProtocol, setLastCustomProtocol] = useState<CustomProtocolType>(() =>
+  const initialLastCustomProtocol: CustomProtocolType =
     initialConfig?.customProtocol === 'openai'
       ? 'openai'
       : initialConfig?.customProtocol === 'gemini'
         ? 'gemini'
-        : 'anthropic'
-  );
-  const [enableThinking, setEnableThinking] = useState(Boolean(initialConfig?.enableThinking));
-  const [discoveredModels, setDiscoveredModels] = useState<
-    Partial<Record<ProviderProfileKey, ProviderModelInfo[]>>
-  >({});
-  const [isLoadingConfig, setIsLoadingConfig] = useState(true);
-  const [savedDraftSignature, setSavedDraftSignature] = useState('');
+        : 'anthropic';
 
-  const [isSaving, setIsSaving] = useState(false);
-  const [isTesting, setIsTesting] = useState(false);
-  const [isRefreshingModels, setIsRefreshingModels] = useState(false);
-  const [isDiscoveringLocalOllama, setIsDiscoveringLocalOllama] = useState(false);
-  const [errorText, setErrorText] = useState('');
-  const [errorKey, setErrorKey] = useState<string | null>(null);
-  const [errorValues, setErrorValues] = useState<Record<string, string | number> | undefined>(
-    undefined
-  );
-  const [successText, setSuccessText] = useState('');
-  const [successKey, setSuccessKey] = useState<string | null>(null);
-  const [successValues, setSuccessValues] = useState<Record<string, string | number> | undefined>(
-    undefined
-  );
-  const [lastSaveCompletedAt, setLastSaveCompletedAt] = useState(0);
-  const [testResult, setTestResult] = useState<ApiTestResult | null>(null);
-  const [useLiveTest, setUseLiveTest] = useState(false);
-  const [diagnosticResult, setDiagnosticResult] = useState<DiagnosticResult | null>(null);
-  const [isDiagnosing, setIsDiagnosing] = useState(false);
+  const [state, dispatch] = useReducer(apiConfigReducer, undefined, (): ApiConfigState => ({
+    presets: FALLBACK_PROVIDER_PRESETS,
+    profiles: initialBootstrap.snapshot.profiles,
+    activeProfileKey: initialBootstrap.snapshot.activeProfileKey,
+    configSets: initialBootstrap.configSets,
+    activeConfigSetId: initialBootstrap.activeConfigSetId,
+    pendingConfigSetAction: null,
+    isMutatingConfigSet: false,
+    lastCustomProtocol: initialLastCustomProtocol,
+    enableThinking: Boolean(initialConfig?.enableThinking),
+    discoveredModels: {},
+    isLoadingConfig: true,
+    savedDraftSignature: '',
+    isSaving: false,
+    isTesting: false,
+    isRefreshingModels: false,
+    isDiscoveringLocalOllama: false,
+    errorText: '',
+    errorKey: null,
+    errorValues: undefined,
+    successText: '',
+    successKey: null,
+    successValues: undefined,
+    lastSaveCompletedAt: 0,
+    testResult: null,
+    diagnosticResult: null,
+    isDiagnosing: false,
+  }));
+
+  // Destructure state for convenience — avoids `state.X` in every expression
+  const {
+    presets,
+    profiles,
+    activeProfileKey,
+    configSets,
+    activeConfigSetId,
+    pendingConfigSetAction,
+    isMutatingConfigSet,
+    lastCustomProtocol,
+    enableThinking,
+    discoveredModels,
+    isLoadingConfig,
+    savedDraftSignature,
+    isSaving,
+    isTesting,
+    isRefreshingModels,
+    isDiscoveringLocalOllama,
+    errorText,
+    errorKey,
+    errorValues,
+    successText,
+    successKey,
+    successValues,
+    lastSaveCompletedAt,
+    testResult,
+    diagnosticResult,
+    isDiagnosing,
+  } = state;
+
   const ollamaRefreshRequestIdRef = useRef(0);
   const latestOllamaTargetRef = useRef<{
     activeProfileKey: ProviderProfileKey;
@@ -626,43 +893,30 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
     baseUrl: '',
     provider: 'openrouter',
   });
-  const autoDiscoveryAttemptedRef = useRef<Set<string>>(new Set());
   const ollamaDiscoverRequestIdRef = useRef(0);
 
   const clearError = useCallback(() => {
-    setErrorText('');
-    setErrorKey(null);
-    setErrorValues(undefined);
+    dispatch({ type: 'CLEAR_ERROR' });
   }, []);
 
   const showErrorKey = useCallback((key: string, values?: Record<string, string | number>) => {
-    setErrorText('');
-    setErrorKey(key);
-    setErrorValues(values);
+    dispatch({ type: 'SET_ERROR_KEY', key, values });
   }, []);
 
   const showErrorText = useCallback((text: string) => {
-    setErrorKey(null);
-    setErrorValues(undefined);
-    setErrorText(text);
+    dispatch({ type: 'SET_ERROR_TEXT', text });
   }, []);
 
   const clearSuccessMessage = useCallback(() => {
-    setSuccessText('');
-    setSuccessKey(null);
-    setSuccessValues(undefined);
+    dispatch({ type: 'CLEAR_SUCCESS' });
   }, []);
 
   const showSuccessKey = useCallback((key: string, values?: Record<string, string | number>) => {
-    setSuccessText('');
-    setSuccessKey(key);
-    setSuccessValues(values);
+    dispatch({ type: 'SET_SUCCESS_KEY', key, values });
   }, []);
 
   const showSuccessText = useCallback((text: string) => {
-    setSuccessKey(null);
-    setSuccessValues(undefined);
-    setSuccessText(text);
+    dispatch({ type: 'SET_SUCCESS_TEXT', text });
   }, []);
 
   const error = errorKey ? t(errorKey, errorValues) : errorText;
@@ -677,9 +931,11 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
   const currentPreset = modelPreset;
   const hasDiscoveredOllamaModels =
     provider === 'ollama' && Object.prototype.hasOwnProperty.call(discoveredModels, activeProfileKey);
-  const modelOptions = hasDiscoveredOllamaModels
+  const modelOptions = provider === 'ollama'
     ? (discoveredModels[activeProfileKey] || [])
-    : modelPreset.models;
+    : hasDiscoveredOllamaModels
+      ? (discoveredModels[activeProfileKey] || [])
+      : modelPreset.models;
   const modelInputGuidance = getModelInputGuidance(provider, customProtocol);
 
   const currentConfigSet = useMemo(
@@ -699,6 +955,11 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
   const model = currentProfile.model;
   const customModel = currentProfile.customModel;
   const useCustomModel = currentProfile.useCustomModel;
+  const shouldShowOllamaManualModelToggle =
+    provider !== 'ollama'
+      || useCustomModel
+      || Boolean(error)
+      || modelOptions.length === 0;
   const contextWindow = currentProfile.contextWindow;
   const maxTokens = currentProfile.maxTokens;
   const detectedProviderSetup = useMemo(
@@ -849,11 +1110,6 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
         (customProtocol === 'openai' && isCustomOpenAiLoopbackGateway(baseUrl)) ||
         (customProtocol === 'gemini' && isCustomGeminiLoopbackGateway(baseUrl))));
   const requiresApiKey = !allowEmptyApiKey;
-  const supportsLiveRequestTest =
-    provider !== 'gemini' && !(provider === 'custom' && customProtocol === 'gemini');
-  const showsCompatibilityProbeHint =
-    provider === 'openrouter' || (provider === 'custom' && customProtocol === 'anthropic');
-
   const currentDraftSignature = useMemo(
     () => buildApiConfigDraftSignature(activeProfileKey, profiles, enableThinking),
     [activeProfileKey, profiles, enableThinking]
@@ -865,34 +1121,33 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
     (config: AppConfig | null | undefined, loadedPresets: ProviderPresets) => {
       const bootstrap = buildApiConfigBootstrap(config, loadedPresets);
 
-      setPresets(loadedPresets);
-      setProfiles(bootstrap.snapshot.profiles);
-      setActiveProfileKey(bootstrap.snapshot.activeProfileKey);
-      setEnableThinking(bootstrap.snapshot.enableThinking);
-      setConfigSets(bootstrap.configSets);
-      setActiveConfigSetId(bootstrap.activeConfigSetId);
-      setPendingConfigSetAction(null);
-
       const activeMeta = profileKeyToProvider(bootstrap.snapshot.activeProfileKey);
-      if (activeMeta.provider === 'custom') {
-        setLastCustomProtocol(activeMeta.customProtocol);
-      } else {
-        setLastCustomProtocol(
-          config?.customProtocol === 'openai'
+      const resolvedLastCustomProtocol: CustomProtocolType =
+        activeMeta.provider === 'custom'
+          ? activeMeta.customProtocol
+          : config?.customProtocol === 'openai'
             ? 'openai'
             : config?.customProtocol === 'gemini'
               ? 'gemini'
-              : 'anthropic'
-        );
-      }
+              : 'anthropic';
 
-      setSavedDraftSignature(
-        buildApiConfigDraftSignature(
-          bootstrap.snapshot.activeProfileKey,
-          bootstrap.snapshot.profiles,
-          bootstrap.snapshot.enableThinking
-        )
-      );
+      dispatch({
+        type: 'APPLY_LOADED_STATE',
+        payload: {
+          presets: loadedPresets,
+          profiles: bootstrap.snapshot.profiles,
+          activeProfileKey: bootstrap.snapshot.activeProfileKey,
+          enableThinking: bootstrap.snapshot.enableThinking,
+          configSets: bootstrap.configSets,
+          activeConfigSetId: bootstrap.activeConfigSetId,
+          lastCustomProtocol: resolvedLastCustomProtocol,
+          savedDraftSignature: buildApiConfigDraftSignature(
+            bootstrap.snapshot.activeProfileKey,
+            bootstrap.snapshot.profiles,
+            bootstrap.snapshot.enableThinking
+          ),
+        },
+      });
     },
     []
   );
@@ -908,14 +1163,9 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
 
   const updateActiveProfile = useCallback(
     (updater: (prev: UIProviderProfile) => UIProviderProfile) => {
-      setProfiles((prev) => ({
-        ...prev,
-        [activeProfileKey]: updater(
-          prev[activeProfileKey] || defaultProfileForKey(activeProfileKey, presets)
-        ),
-      }));
+      dispatch({ type: 'UPDATE_PROFILE_FN', profileKey: activeProfileKey, updater });
     },
-    [activeProfileKey, presets]
+    [activeProfileKey]
   );
 
   const changeProvider = useCallback(
@@ -924,14 +1174,14 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
         newProvider,
         newProvider === 'custom' ? lastCustomProtocol : 'anthropic'
       );
-      setActiveProfileKey(nextProfileKey);
+      dispatch({ type: 'SET_ACTIVE_PROFILE_KEY', payload: nextProfileKey });
     },
     [lastCustomProtocol]
   );
 
   const changeProtocol = useCallback((newProtocol: CustomProtocolType) => {
-    setLastCustomProtocol(newProtocol);
-    setActiveProfileKey(profileKeyFromProvider('custom', newProtocol));
+    dispatch({ type: 'SET_LAST_CUSTOM_PROTOCOL', payload: newProtocol });
+    dispatch({ type: 'SET_ACTIVE_PROFILE_KEY', payload: profileKeyFromProvider('custom', newProtocol) });
   }, []);
 
   const setApiKey = useCallback(
@@ -988,21 +1238,19 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
       const nextModelState = buildSetupModelState(setup, nextProfileKey, presets);
 
       if (nextProvider === 'custom') {
-        setLastCustomProtocol(setup.recommendedProtocol);
+        dispatch({ type: 'SET_LAST_CUSTOM_PROTOCOL', payload: setup.recommendedProtocol });
       }
 
-      setProfiles((prev) => {
-        const current = prev[nextProfileKey] || defaultProfileForKey(nextProfileKey, presets);
-        return {
-          ...prev,
-          [nextProfileKey]: {
-            ...current,
-            baseUrl: setup.recommendedBaseUrl,
-            ...nextModelState,
-          },
-        };
+      dispatch({
+        type: 'UPDATE_PROFILE_FN',
+        profileKey: nextProfileKey,
+        updater: (current) => ({
+          ...current,
+          baseUrl: setup.recommendedBaseUrl,
+          ...nextModelState,
+        }),
       });
-      setActiveProfileKey(nextProfileKey);
+      dispatch({ type: 'SET_ACTIVE_PROFILE_KEY', payload: nextProfileKey });
     },
     [presets]
   );
@@ -1023,15 +1271,20 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
     });
   }, [updateActiveProfile]);
 
+  // Public setter exposed to consumers — wraps dispatch so the interface stays stable
+  const setEnableThinking = useCallback((value: boolean) => {
+    dispatch({ type: 'SET_ENABLE_THINKING', payload: value });
+  }, []);
+
   useEffect(() => {
     if (!enabled) {
-      setLastSaveCompletedAt(0);
+      dispatch({ type: 'SET_LAST_SAVE_COMPLETED_AT', payload: 0 });
       return;
     }
 
     let cancelled = false;
     async function load() {
-      setIsLoadingConfig(true);
+      dispatch({ type: 'SET_IS_LOADING_CONFIG', payload: true });
       try {
         const loadedPresets = isElectron
           ? await window.electronAPI.config.getPresets()
@@ -1048,7 +1301,7 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
         }
       } finally {
         if (!cancelled) {
-          setIsLoadingConfig(false);
+          dispatch({ type: 'SET_IS_LOADING_CONFIG', payload: false });
         }
       }
     }
@@ -1061,8 +1314,8 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
 
   useEffect(() => {
     clearError();
-    setTestResult(null);
-    setDiagnosticResult(null);
+    dispatch({ type: 'SET_TEST_RESULT', payload: null });
+    dispatch({ type: 'SET_DIAGNOSTIC_RESULT', payload: null });
   }, [
     activeConfigSetId,
     activeProfileKey,
@@ -1086,21 +1339,29 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
     if (provider !== 'ollama') {
       return;
     }
-    setDiscoveredModels((prev) => {
-      if (!prev[activeProfileKey]) {
-        return prev;
-      }
-      const next = { ...prev };
-      delete next[activeProfileKey];
-      return next;
-    });
-  }, [activeProfileKey, baseUrl, provider]);
+    // Drop stale discovered model list when baseUrl changes
+    dispatch({ type: 'DELETE_DISCOVERED_MODELS', profileKey: activeProfileKey });
 
-  useEffect(() => {
-    if (!supportsLiveRequestTest && useLiveTest) {
-      setUseLiveTest(false);
-    }
-  }, [supportsLiveRequestTest, useLiveTest]);
+    // If the current model came from discovered models and is not in presets,
+    // reset to an endpoint-selected model once discovery runs again.
+    const preset = modelPresetForProfile(activeProfileKey, presets);
+    dispatch({
+      type: 'UPDATE_PROFILE_FN',
+      profileKey: activeProfileKey,
+      updater: (current) => {
+        if (current && !current.useCustomModel && current.model) {
+          const inPreset = preset.models.some((m) => m.id === current.model);
+          if (!inPreset) {
+            return {
+              ...current,
+              model: provider === 'ollama' ? '' : (preset.models[0]?.id || ''),
+            };
+          }
+        }
+        return current;
+      },
+    });
+  }, [activeProfileKey, baseUrl, provider, presets]);
 
   const handleTest = useCallback(async () => {
     if (requiresApiKey && !apiKey.trim()) {
@@ -1120,8 +1381,8 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
     }
 
     clearError();
-    setIsTesting(true);
-    setTestResult(null);
+    dispatch({ type: 'SET_IS_TESTING', payload: true });
+    dispatch({ type: 'SET_TEST_RESULT', payload: null });
     try {
       const resolvedBaseUrl =
         provider === 'custom' || provider === 'ollama'
@@ -1134,21 +1395,23 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
         baseUrl: resolvedBaseUrl || undefined,
         customProtocol,
         model: finalModel,
-        useLiveRequest: useLiveTest,
       });
-      setTestResult(result);
+      dispatch({ type: 'SET_TEST_RESULT', payload: result });
       if (result.ok && hasUnsavedChanges) {
         showSuccessKey('api.testSuccessNeedSave');
         setTimeout(() => clearSuccessMessage(), 2500);
       }
     } catch (testError) {
-      setTestResult({
-        ok: false,
-        errorType: 'unknown',
-        details: testError instanceof Error ? testError.message : String(testError),
+      dispatch({
+        type: 'SET_TEST_RESULT',
+        payload: {
+          ok: false,
+          errorType: 'unknown',
+          details: testError instanceof Error ? testError.message : String(testError),
+        },
       });
     } finally {
-      setIsTesting(false);
+      dispatch({ type: 'SET_IS_TESTING', payload: false });
     }
   }, [
     apiKey,
@@ -1163,21 +1426,20 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
     clearError,
     clearSuccessMessage,
     useCustomModel,
-    useLiveTest,
     showErrorKey,
     showSuccessKey,
   ]);
 
-  const handleDiagnose = useCallback(async () => {
+  const handleDiagnose = useCallback(async (verificationLevel: 'fast' | 'deep' = 'fast') => {
     if (requiresApiKey && !apiKey.trim()) {
       showErrorKey('api.testError.missing_key');
       return;
     }
 
     clearError();
-    setIsDiagnosing(true);
-    setDiagnosticResult(null);
-    setTestResult(null);
+    dispatch({ type: 'SET_IS_DIAGNOSING', payload: true });
+    dispatch({ type: 'SET_DIAGNOSTIC_RESULT', payload: null });
+    dispatch({ type: 'SET_TEST_RESULT', payload: null });
     try {
       const resolvedBaseUrl =
         provider === 'custom' || provider === 'ollama'
@@ -1192,12 +1454,13 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
         baseUrl: resolvedBaseUrl || undefined,
         customProtocol,
         model: finalModel || undefined,
+        verificationLevel,
       });
-      setDiagnosticResult(result);
+      dispatch({ type: 'SET_DIAGNOSTIC_RESULT', payload: result });
     } catch (err) {
       showErrorText((err as Error).message || 'Diagnosis failed');
     } finally {
-      setIsDiagnosing(false);
+      dispatch({ type: 'SET_IS_DIAGNOSING', payload: false });
     }
   }, [
     requiresApiKey,
@@ -1214,6 +1477,10 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
     showErrorText,
   ]);
 
+  const handleDeepDiagnose = useCallback(async () => {
+    await handleDiagnose('deep');
+  }, [handleDiagnose]);
+
   const refreshModelOptions = useCallback(async () => {
     if (!isElectron || provider !== 'ollama') {
       return [];
@@ -1223,7 +1490,7 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
     const requestedBaseUrl = baseUrl.trim();
     const requestId = ++ollamaRefreshRequestIdRef.current;
 
-    setIsRefreshingModels(true);
+    dispatch({ type: 'SET_IS_REFRESHING_MODELS', payload: true });
     clearError();
     try {
       const models = await window.electronAPI.config.listModels({
@@ -1242,15 +1509,27 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
         return models;
       }
 
-      setDiscoveredModels((prev) => ({
-        ...prev,
-        [requestedProfileKey]: models,
-      }));
+      dispatch({ type: 'SET_DISCOVERED_MODELS', profileKey: requestedProfileKey, models });
 
-      const currentModel = useCustomModel ? customModel.trim() : model;
-      if (!currentModel && models[0]) {
-        setModel(models[0].id);
-      }
+      dispatch({
+        type: 'UPDATE_PROFILE_FN',
+        profileKey: requestedProfileKey,
+        updater: (current) => {
+          const explicitManualModel = current.useCustomModel ? current.customModel.trim() : '';
+          const currentModel = explicitManualModel || current.model.trim();
+          const hasDiscoveredMatch = models.some((item) => item.id === currentModel);
+          const shouldAutoSelectModel =
+            Boolean(models[0]?.id) &&
+            !explicitManualModel &&
+            (!currentModel || !hasDiscoveredMatch);
+
+          return {
+            ...current,
+            model: shouldAutoSelectModel ? models[0]!.id : current.model,
+            useCustomModel: shouldAutoSelectModel ? false : current.useCustomModel,
+          };
+        },
+      });
       return models;
     } catch (refreshError) {
       const latestTarget = latestOllamaTargetRef.current;
@@ -1262,7 +1541,7 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
       ) {
         return [];
       }
-      clearDiscoveredModelsForProfile(setDiscoveredModels, requestedProfileKey);
+      dispatch({ type: 'CLEAR_DISCOVERED_MODELS', profileKey: requestedProfileKey });
       if (refreshError instanceof Error) {
         showErrorText(refreshError.message);
       } else {
@@ -1271,19 +1550,16 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
       return [];
     } finally {
       if (requestId === ollamaRefreshRequestIdRef.current) {
-        setIsRefreshingModels(false);
+        dispatch({ type: 'SET_IS_REFRESHING_MODELS', payload: false });
       }
     }
   }, [
     activeProfileKey,
     apiKey,
     baseUrl,
-    customModel,
-    model,
+    presets,
     provider,
-    setModel,
     clearError,
-    useCustomModel,
     showErrorKey,
     showErrorText,
   ]);
@@ -1298,30 +1574,31 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
       const normalizedBaseUrl =
         normalizeOllamaBaseUrl(discoveredBaseUrl) || DEFAULT_OLLAMA_BASE_URL;
 
-      setProfiles((prev) => {
-        const current = prev[targetProfileKey] || defaultProfileForKey(targetProfileKey, presets);
-        const currentPresetModel = current.model.trim();
-        const hasPresetMatch = models.some((item) => item.id === currentPresetModel);
-        const autoSelectModelId = options?.autoSelectModelId?.trim() || '';
-        const shouldAdoptFirstPresetModel =
-          !current.useCustomModel && Boolean(autoSelectModelId) && (!currentPresetModel || !hasPresetMatch);
+      dispatch({
+        type: 'UPDATE_PROFILE_FN',
+        profileKey: targetProfileKey,
+        updater: (current) => {
+          const autoSelectModelId = options?.autoSelectModelId?.trim() || '';
+          const explicitManualModel = current.useCustomModel ? current.customModel.trim() : '';
+          const currentModel = explicitManualModel || current.model.trim();
+          const hasDiscoveredMatch = models.some((item) => item.id === currentModel);
+          const shouldAutoSelectModel =
+            Boolean(autoSelectModelId) &&
+            !explicitManualModel &&
+            (!currentModel || !hasDiscoveredMatch);
 
-        return {
-          ...prev,
-          [targetProfileKey]: {
+          return {
             ...current,
             baseUrl: normalizedBaseUrl,
-            model: shouldAdoptFirstPresetModel ? autoSelectModelId : current.model,
-          },
-        };
+            model: shouldAutoSelectModel ? autoSelectModelId : current.model,
+            useCustomModel: shouldAutoSelectModel ? false : current.useCustomModel,
+          };
+        },
       });
 
-      setDiscoveredModels((prev) => ({
-        ...prev,
-        [targetProfileKey]: models,
-      }));
+      dispatch({ type: 'SET_DISCOVERED_MODELS', profileKey: targetProfileKey, models });
     },
-    [presets]
+    []
   );
 
   const discoverLocalOllama = useCallback(
@@ -1334,7 +1611,7 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
       const requestedBaseUrl = baseUrl.trim();
       const shouldClearDiscoveredModels = !requestedBaseUrl || isLoopbackBaseUrl(requestedBaseUrl);
       const requestId = ++ollamaDiscoverRequestIdRef.current;
-      setIsDiscoveringLocalOllama(true);
+      dispatch({ type: 'SET_IS_DISCOVERING_LOCAL_OLLAMA', payload: true });
       if (!options?.silent) {
         clearError();
       }
@@ -1354,7 +1631,7 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
         }
         if (!result.available) {
           if (shouldClearDiscoveredModels) {
-            clearDiscoveredModelsForProfile(setDiscoveredModels, requestedProfileKey);
+            dispatch({ type: 'CLEAR_DISCOVERED_MODELS', profileKey: requestedProfileKey });
           }
           if (!options?.silent) {
             showErrorKey('api.localOllamaNotFound');
@@ -1364,16 +1641,12 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
 
         const models = normalizeDiscoveredOllamaModels(result.models);
         applyDiscoveredOllamaState(requestedProfileKey, result.baseUrl, models, {
-          autoSelectModelId: result.status === 'model_usable' ? result.probeModel : undefined,
+          autoSelectModelId: models[0]?.id,
         });
 
         if (!options?.silent) {
           if (result.status === 'service_available') {
             showErrorKey('api.localOllamaNoModels');
-          } else if (result.status === 'model_unusable') {
-            showErrorKey('api.localOllamaModelUnavailable', {
-              model: result.probeModel || models[0]?.id || '',
-            });
           } else {
             showSuccessKey('api.localOllamaDiscovered', { count: models.length });
             setTimeout(() => clearSuccessMessage(), 2500);
@@ -1391,7 +1664,7 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
           return null;
         }
         if (shouldClearDiscoveredModels) {
-          clearDiscoveredModelsForProfile(setDiscoveredModels, requestedProfileKey);
+          dispatch({ type: 'CLEAR_DISCOVERED_MODELS', profileKey: requestedProfileKey });
         }
         if (!options?.silent) {
           if (discoveryError instanceof Error) {
@@ -1403,7 +1676,7 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
         return null;
       } finally {
         if (requestId === ollamaDiscoverRequestIdRef.current) {
-          setIsDiscoveringLocalOllama(false);
+          dispatch({ type: 'SET_IS_DISCOVERING_LOCAL_OLLAMA', payload: false });
         }
       }
     },
@@ -1414,7 +1687,6 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
       clearError,
       clearSuccessMessage,
       provider,
-      setDiscoveredModels,
       showErrorKey,
       showErrorText,
       showSuccessKey,
@@ -1431,27 +1703,7 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
       void refreshModelOptions();
     }, 800);
     return () => clearTimeout(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [provider, baseUrl]);
-
-  useEffect(() => {
-    if (!isElectron || provider !== 'ollama') {
-      return;
-    }
-
-    const normalizedBaseUrl = normalizeOllamaBaseUrl(baseUrl) || DEFAULT_OLLAMA_BASE_URL;
-    if (!shouldAutoDiscoverLocalOllamaBaseUrl(baseUrl) || !isLoopbackBaseUrl(normalizedBaseUrl)) {
-      return;
-    }
-
-    const attemptKey = `${activeProfileKey}:${normalizedBaseUrl}`;
-    if (autoDiscoveryAttemptedRef.current.has(attemptKey)) {
-      return;
-    }
-
-    autoDiscoveryAttemptedRef.current.add(attemptKey);
-    void discoverLocalOllama({ silent: true });
-  }, [activeProfileKey, baseUrl, discoverLocalOllama, provider]);
+  }, [provider, baseUrl, refreshModelOptions]);
 
   const handleSave = useCallback(
     async (options?: { silentSuccess?: boolean }) => {
@@ -1472,7 +1724,7 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
       }
 
       clearError();
-      setIsSaving(true);
+      dispatch({ type: 'SET_IS_SAVING', payload: true });
       try {
         const resolvedBaseUrl =
           provider === 'custom' || provider === 'ollama'
@@ -1500,10 +1752,10 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
           applyPersistedConfigToStore(result.config, presets);
         }
 
-        setSavedDraftSignature(currentDraftSignature);
+        dispatch({ type: 'SET_SAVED_DRAFT_SIGNATURE', payload: currentDraftSignature });
         if (!options?.silentSuccess) {
           showSuccessKey('common.saved');
-          setLastSaveCompletedAt(Date.now());
+          dispatch({ type: 'SET_LAST_SAVE_COMPLETED_AT', payload: Date.now() });
           setTimeout(() => clearSuccessMessage(), 2000);
         }
         return true;
@@ -1515,7 +1767,7 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
         }
         return false;
       } finally {
-        setIsSaving(false);
+        dispatch({ type: 'SET_IS_SAVING', payload: false });
       }
     },
     [
@@ -1551,7 +1803,7 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
         return false;
       }
 
-      setIsMutatingConfigSet(true);
+      dispatch({ type: 'SET_IS_MUTATING_CONFIG_SET', payload: true });
       clearError();
       try {
         const result = await window.electronAPI.config.switchSet({ id: setId });
@@ -1569,7 +1821,7 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
         }
         return false;
       } finally {
-        setIsMutatingConfigSet(false);
+        dispatch({ type: 'SET_IS_MUTATING_CONFIG_SET', payload: false });
       }
     },
     [
@@ -1601,7 +1853,7 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
         return false;
       }
 
-      setIsMutatingConfigSet(true);
+      dispatch({ type: 'SET_IS_MUTATING_CONFIG_SET', payload: true });
       clearError();
       try {
         const result = await window.electronAPI.config.createSet({
@@ -1621,7 +1873,7 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
         }
         return false;
       } finally {
-        setIsMutatingConfigSet(false);
+        dispatch({ type: 'SET_IS_MUTATING_CONFIG_SET', payload: false });
       }
     },
     [
@@ -1653,7 +1905,7 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
 
       const action: PendingConfigSetAction = { type: 'switch', targetSetId: setId };
       if (hasUnsavedChanges) {
-        setPendingConfigSetAction(action);
+        dispatch({ type: 'SET_PENDING_CONFIG_SET_ACTION', payload: action });
         return;
       }
 
@@ -1670,7 +1922,7 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
   );
 
   const cancelPendingConfigSetAction = useCallback(() => {
-    setPendingConfigSetAction(null);
+    dispatch({ type: 'SET_PENDING_CONFIG_SET_ACTION', payload: null });
   }, []);
 
   const saveAndContinuePendingConfigSetAction = useCallback(async () => {
@@ -1682,7 +1934,7 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
     if (!saved) {
       return;
     }
-    setPendingConfigSetAction(null);
+    dispatch({ type: 'SET_PENDING_CONFIG_SET_ACTION', payload: null });
     await continuePendingConfigSetAction(action);
   }, [continuePendingConfigSetAction, handleSave, pendingConfigSetAction]);
 
@@ -1691,7 +1943,7 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
       return;
     }
     const action = pendingConfigSetAction;
-    setPendingConfigSetAction(null);
+    dispatch({ type: 'SET_PENDING_CONFIG_SET_ACTION', payload: null });
     await continuePendingConfigSetAction(action);
   }, [continuePendingConfigSetAction, pendingConfigSetAction]);
 
@@ -1717,7 +1969,7 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
         return false;
       }
 
-      setIsMutatingConfigSet(true);
+      dispatch({ type: 'SET_IS_MUTATING_CONFIG_SET', payload: true });
       clearError();
       try {
         const result = await window.electronAPI.config.renameSet({ id, name: trimmed });
@@ -1733,7 +1985,7 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
         }
         return false;
       } finally {
-        setIsMutatingConfigSet(false);
+        dispatch({ type: 'SET_IS_MUTATING_CONFIG_SET', payload: false });
       }
     },
     [
@@ -1754,7 +2006,7 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
         return false;
       }
 
-      setIsMutatingConfigSet(true);
+      dispatch({ type: 'SET_IS_MUTATING_CONFIG_SET', payload: true });
       clearError();
       try {
         const result = await window.electronAPI.config.deleteSet({ id });
@@ -1770,7 +2022,7 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
         }
         return false;
       } finally {
-        setIsMutatingConfigSet(false);
+        dispatch({ type: 'SET_IS_MUTATING_CONFIG_SET', payload: false });
       }
     },
     [
@@ -1815,14 +2067,13 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
     lastSaveCompletedAt,
     testResult,
     friendlyTestDetails,
-    useLiveTest,
-    supportsLiveRequestTest,
     diagnosticResult,
     isDiagnosing,
     handleDiagnose,
+    handleDeepDiagnose,
     isOllamaMode: provider === 'ollama',
+    shouldShowOllamaManualModelToggle,
     requiresApiKey,
-    showsCompatibilityProbeHint,
     detectedProviderSetup,
     protocolGuidanceText,
     protocolGuidanceTone,
@@ -1844,7 +2095,6 @@ export function useApiConfigState(options: UseApiConfigStateOptions = {}) {
     setContextWindow,
     setMaxTokens,
     toggleCustomModel,
-    setUseLiveTest,
     setEnableThinking,
     applyCommonProviderSetup,
     changeProvider,

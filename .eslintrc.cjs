@@ -10,7 +10,7 @@ module.exports = {
     'plugin:@typescript-eslint/recommended',
     'plugin:react-hooks/recommended',
   ],
-  ignorePatterns: ['dist', 'dist-electron', '.eslintrc.cjs'],
+  ignorePatterns: ['dist', 'dist-electron', 'dist-mcp', 'dist-wsl-agent', 'dist-lima-agent', '.eslintrc.cjs'],
   parser: '@typescript-eslint/parser',
   parserOptions: {
     ecmaVersion: 'latest',
@@ -19,7 +19,7 @@ module.exports = {
   plugins: ['@typescript-eslint', 'react-hooks'],
   rules: {
     '@typescript-eslint/no-unused-vars': ['warn', { argsIgnorePattern: '^_' }],
-    '@typescript-eslint/no-explicit-any': 'warn',
+    '@typescript-eslint/no-explicit-any': 'error',
     'react-hooks/rules-of-hooks': 'error',
     'react-hooks/exhaustive-deps': 'warn',
   },

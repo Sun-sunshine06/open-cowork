@@ -378,6 +378,7 @@ export type ServerEvent =
   | { type: 'session.update'; payload: { sessionId: string; updates: Partial<Session> } }
   | { type: 'session.list'; payload: { sessions: Session[] } }
   | { type: 'permission.request'; payload: PermissionRequest }
+  | { type: 'permission.dismiss'; payload: { toolUseId: string } }
   | { type: 'sudo.password.request'; payload: SudoPasswordRequest }
   | { type: 'sudo.password.dismiss'; payload: { toolUseId: string } }
   | { type: 'trace.step'; payload: { sessionId: string; step: TraceStep } }
@@ -389,12 +390,12 @@ export type ServerEvent =
   | { type: 'skills.storageChanged'; payload: SkillsStorageChangeEvent }
   | { type: 'plugins.runtimeApplied'; payload: { sessionId: string; plugins: Array<{ name: string; path: string }> } }
   | { type: 'workdir.changed'; payload: { path: string } }
-  | { type: 'proxy.warmup'; payload: { status: 'warming' | 'ready' | 'failed' } }
   | { type: 'session.contextInfo'; payload: { sessionId: string; contextWindow: number } }
   | { type: 'navigate.to'; payload: { page: 'welcome' | 'settings' | 'session'; tab?: string; sessionId?: string } }
   | { type: 'native-theme.changed'; payload: { shouldUseDarkColors: boolean } }
   | { type: 'new-session' }
   | { type: 'navigate'; payload: string }
+  | { type: 'scheduled-task.error'; payload: { taskId: string; error: string } }
   | { type: 'error'; payload: { message: string; code?: 'CONFIG_REQUIRED_ACTIVE_SET'; action?: 'open_api_settings' } };
 
 // Settings types
@@ -516,6 +517,7 @@ export interface ApiTestInput {
   customProtocol?: AppConfig['customProtocol'];
   model?: string;
   useLiveRequest?: boolean;
+  verificationLevel?: DiagnosticVerificationLevel;
 }
 
 export interface ApiTestResult {
@@ -531,10 +533,7 @@ export interface ApiTestResult {
     | 'server_error'
     | 'network_error'
     | 'ollama_not_running'
-    | 'proxy_boot_failed'
-    | 'proxy_health_failed'
-    | 'proxy_upstream_auth_failed'
-    | 'proxy_upstream_not_found'
+    | 'ollama_loading'
     | 'unknown';
   details?: string;
 }
@@ -542,6 +541,8 @@ export interface ApiTestResult {
 // API Diagnostics types
 export type DiagnosticStepName = 'dns' | 'tcp' | 'tls' | 'auth' | 'model';
 export type DiagnosticStepStatus = 'pending' | 'running' | 'ok' | 'fail' | 'skip';
+export type DiagnosticVerificationLevel = 'fast' | 'deep';
+export type DiagnosticAdvisoryCode = 'not_deep_verified' | 'model_loading' | 'manual_model';
 
 export interface DiagnosticStep {
   name: DiagnosticStepName;
@@ -557,6 +558,11 @@ export interface DiagnosticResult {
   /** Which step failed first (null if all ok) */
   failedAt?: DiagnosticStepName;
   totalLatencyMs: number;
+  verificationLevel?: DiagnosticVerificationLevel;
+  advisoryCode?: DiagnosticAdvisoryCode;
+  advisoryText?: string;
+  /** Present when the run was skipped (e.g. 'concurrent_run') */
+  skippedReason?: string;
 }
 
 export interface DiagnosticInput {
@@ -565,12 +571,25 @@ export interface DiagnosticInput {
   baseUrl?: string;
   customProtocol?: AppConfig['customProtocol'];
   model?: string;
+  verificationLevel?: DiagnosticVerificationLevel;
 }
 
 export interface LocalServiceInfo {
   type: 'ollama';
   baseUrl: string;
   models?: string[];
+}
+
+export type LocalOllamaDiscoveryStatus =
+  | 'unavailable'
+  | 'service_available'
+  | 'models_available';
+
+export interface LocalOllamaDiscoveryResult {
+  available: boolean;
+  baseUrl: string;
+  models?: string[];
+  status: LocalOllamaDiscoveryStatus;
 }
 
 // MCP types

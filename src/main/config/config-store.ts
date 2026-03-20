@@ -11,8 +11,12 @@
  *
  * Dependencies: electron-store, auth-utils, api-model-presets
  */
-import Store from 'electron-store';
+import Store, { type Options as StoreOptions } from 'electron-store';
 import { log, logWarn } from '../utils/logger';
+import {
+  createEncryptedStoreWithKeyRotation,
+  getLegacyDerivedKeyHexes,
+} from '../utils/store-encryption';
 import {
   isOpenAIProvider,
   isOllamaLegacyCustomOpenAIConfig,
@@ -237,7 +241,7 @@ export async function getPiAiModelPresets(): Promise<typeof PROVIDER_PRESETS> {
       const preset = PROVIDER_PRESETS[providerKey as keyof typeof PROVIDER_PRESETS];
       if (!preset) continue;
 
-      const registryModels = getModels(curated.piProvider as any);
+      const registryModels = getModels(curated.piProvider);
       if (!registryModels || registryModels.length === 0) continue;
 
       const registryIds = new Set(registryModels.map(m => m.id));
@@ -271,6 +275,7 @@ const PROFILE_KEYS: ProviderProfileKey[] = [
   'custom:openai',
   'custom:gemini',
 ];
+const VALID_THEMES: AppTheme[] = ['dark', 'light', 'system'];
 
 function isProviderType(value: unknown): value is ProviderType {
   return value === 'openrouter' || value === 'anthropic' || value === 'custom' || value === 'openai' || value === 'gemini' || value === 'ollama';
@@ -282,6 +287,10 @@ function isCustomProtocol(value: unknown): value is CustomProtocolType {
 
 function isProfileKey(value: unknown): value is ProviderProfileKey {
   return typeof value === 'string' && PROFILE_KEYS.includes(value as ProviderProfileKey);
+}
+
+function isAppTheme(value: unknown): value is AppTheme {
+  return typeof value === 'string' && VALID_THEMES.includes(value as AppTheme);
 }
 
 function profileKeyFromProvider(provider: ProviderType, customProtocol: CustomProtocolType = 'anthropic'): ProviderProfileKey {
@@ -356,15 +365,31 @@ export class ConfigStore {
   private store: Store<AppConfig>;
 
   constructor() {
-    const storeOptions: any = {
+    const storeOptions: StoreOptions<AppConfig> & { projectName?: string } = {
       name: 'config',
       projectName: 'open-cowork',
       defaults: defaultConfig,
-      // Encrypt the API key for basic security
-      encryptionKey: 'open-cowork-config-v1',
     };
 
-    this.store = new Store<AppConfig>(storeOptions);
+    // Cast to satisfy the Record<string, unknown> constraint of the encrypted store utility;
+    // AppConfig is a structurally compatible object type at runtime.
+    type AppConfigRecord = AppConfig & Record<string, unknown>;
+    this.store = createEncryptedStoreWithKeyRotation<AppConfigRecord>({
+      stableKey: 'open-cowork-config-stable-v1',
+      legacyKeys: [
+        'open-cowork-config-v1',
+        ...getLegacyDerivedKeyHexes({
+          moduleDirname: __dirname,
+          stableSeed: 'open-cowork-config-stable-v1',
+          legacySeed: 'open-cowork-config-v1',
+          salt: 'open-cowork-config-salt',
+        }),
+      ],
+      storeOptions: storeOptions as StoreOptions<AppConfigRecord> & { projectName?: string },
+      logPrefix: '[ConfigStore]',
+      log,
+      warn: logWarn,
+    }) as unknown as Store<AppConfig>;
     this.ensureNormalized();
   }
 
@@ -774,7 +799,7 @@ export class ConfigStore {
       defaultWorkdir: typeof raw.defaultWorkdir === 'string' ? raw.defaultWorkdir : defaultConfig.defaultWorkdir,
       globalSkillsPath: typeof raw.globalSkillsPath === 'string' ? raw.globalSkillsPath : defaultConfig.globalSkillsPath,
       enableDevLogs: toBoolean(raw.enableDevLogs, defaultConfig.enableDevLogs),
-      theme: raw.theme === 'dark' || raw.theme === 'system' ? raw.theme : defaultConfig.theme,
+      theme: isAppTheme(raw.theme) ? raw.theme : defaultConfig.theme,
       sandboxEnabled: toBoolean(raw.sandboxEnabled, defaultConfig.sandboxEnabled),
       enableThinking: projected.enableThinking,
       isConfigured: toBoolean(raw.isConfigured, defaultConfig.isConfigured),
@@ -819,7 +844,7 @@ export class ConfigStore {
   private buildUniqueConfigSetName(name: string, existingSets: ApiConfigSet[], excludeId?: string): string {
     const trimmed = name.trim();
     if (!trimmed) {
-      throw new Error('配置方案名称不能为空');
+      throw new Error('Config set name is required');
     }
 
     const usedNames = new Set(
@@ -916,7 +941,7 @@ export class ConfigStore {
   createSet(payload: CreateConfigSetPayload): AppConfig {
     const current = this.getAll();
     if (current.configSets.length >= MAX_CONFIG_SET_COUNT) {
-      throw new Error(`最多只能保存 ${MAX_CONFIG_SET_COUNT} 个配置方案`);
+      throw new Error(`Config set limit reached: max ${MAX_CONFIG_SET_COUNT}`);
     }
 
     const id = this.generateConfigSetId(current.configSets);
@@ -943,7 +968,7 @@ export class ConfigStore {
         || current.configSets[0];
 
       if (!source) {
-        throw new Error('找不到可复制的配置方案');
+        throw new Error('Config set clone source not found');
       }
 
       const cloned = this.cloneConfigSet(source);
@@ -967,7 +992,7 @@ export class ConfigStore {
     const current = this.getAll();
     const target = current.configSets.find((set) => set.id === payload.id);
     if (!target) {
-      throw new Error('配置方案不存在');
+      throw new Error('Config set not found');
     }
 
     const nextName = this.buildUniqueConfigSetName(payload.name, current.configSets, payload.id);
@@ -991,13 +1016,13 @@ export class ConfigStore {
     const current = this.getAll();
     const target = current.configSets.find((set) => set.id === payload.id);
     if (!target) {
-      throw new Error('配置方案不存在');
+      throw new Error('Config set not found');
     }
     if (target.isSystem) {
-      throw new Error('默认方案不可删除');
+      throw new Error('System config set cannot be deleted');
     }
     if (current.configSets.length <= 1) {
-      throw new Error('至少需要保留一个配置方案');
+      throw new Error('At least one config set must be kept');
     }
 
     const nextSets = current.configSets
@@ -1017,7 +1042,7 @@ export class ConfigStore {
   switchSet(payload: { id: string }): AppConfig {
     const current = this.getAll();
     if (!current.configSets.some((set) => set.id === payload.id)) {
-      throw new Error('配置方案不存在');
+      throw new Error('Config set not found');
     }
 
     this.saveConfig(this.composeProjectedConfig(current, current.configSets, payload.id));

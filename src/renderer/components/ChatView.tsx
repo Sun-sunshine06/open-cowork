@@ -1,5 +1,15 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
+import {
+  useActiveSessionId,
+  useCurrentSession,
+  useActiveSessionMessages,
+  useActivePartialContent,
+  useActiveTurn,
+  usePendingTurns,
+  useActiveExecutionClock,
+  useAppConfig,
+} from '../store/selectors';
 import { useAppStore } from '../store';
 import { useIPC } from '../hooks/useIPC';
 import { MessageCard } from './MessageCard';
@@ -16,19 +26,20 @@ type AttachedFile = {
 
 export function ChatView() {
   const { t } = useTranslation();
-  const activeSessionId = useAppStore((s) => s.activeSessionId);
-  const sessions = useAppStore((s) => s.sessions);
-  const messagesBySession = useAppStore((s) => s.messagesBySession);
-  const partialMessagesBySession = useAppStore((s) => s.partialMessagesBySession);
-  const partialThinkingBySession = useAppStore((s) => s.partialThinkingBySession);
-  const activeTurnsBySession = useAppStore((s) => s.activeTurnsBySession);
-  const pendingTurnsBySession = useAppStore((s) => s.pendingTurnsBySession);
-  const executionClockBySession = useAppStore((s) => s.executionClockBySession);
-  const appConfig = useAppStore((s) => s.appConfig);
+  // Scoped selectors — each subscription only re-renders when its slice changes
+  const activeSessionId = useActiveSessionId();
+  const activeSession = useCurrentSession();
+  const messages = useActiveSessionMessages();
+  const { partialMessage, partialThinking } = useActivePartialContent();
+  const activeTurn = useActiveTurn();
+  const pendingTurns = usePendingTurns();
+  const executionClock = useActiveExecutionClock();
+  const appConfig = useAppConfig();
+  const setGlobalNotice = useAppStore((s) => s.setGlobalNotice);
   const { continueSession, stopSession, isElectron } = useIPC();
   const [prompt, setPrompt] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [activeConnectors, setActiveConnectors] = useState<any[]>([]);
+  const [activeConnectors, setActiveConnectors] = useState<{ id: string; name: string; connected: boolean; toolCount: number }[]>([]);
   const [showConnectorLabel, setShowConnectorLabel] = useState(true);
   const headerRef = useRef<HTMLDivElement>(null);
   const titleRef = useRef<HTMLHeadingElement>(null);
@@ -50,14 +61,6 @@ export function ChatView() {
   const scrollRequestRef = useRef<number | null>(null);
   const isScrollingRef = useRef(false);
 
-  const activeSession = sessions.find((s) => s.id === activeSessionId);
-  const messages = activeSessionId ? messagesBySession[activeSessionId] || [] : [];
-  const pendingTurns = activeSessionId ? pendingTurnsBySession[activeSessionId] || [] : [];
-  const partialMessage = activeSessionId ? partialMessagesBySession[activeSessionId] || '' : '';
-  const partialThinking = activeSessionId
-    ? partialThinkingBySession[activeSessionId] || ''
-    : '';
-  const activeTurn = activeSessionId ? activeTurnsBySession[activeSessionId] : null;
   const hasActiveTurn = Boolean(activeTurn);
   const pendingCount = pendingTurns.length;
   const isSessionRunning = activeSession?.status === 'running';
@@ -106,7 +109,6 @@ export function ChatView() {
   }, []);
 
   // --- Real-time execution timer ---
-  const executionClock = activeSessionId ? executionClockBySession[activeSessionId] : undefined;
   const [clockNow, setClockNow] = useState(() => Date.now());
 
   useEffect(() => {
@@ -270,10 +272,15 @@ export function ChatView() {
         newImages.push({
           url,
           base64,
-          mediaType: resizedBlob.type as any,
+          mediaType: resizedBlob.type as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
         });
       } catch (err) {
-        console.error('Failed to process pasted image:', err);
+        // Notify the user instead of silently dropping the error
+        setGlobalNotice({
+          id: `image-paste-failed-${Date.now()}`,
+          type: 'warning',
+          message: t('chat.imageProcessFailed'),
+        });
       }
     }
 
@@ -402,7 +409,7 @@ export function ChatView() {
 
       // Get file info for each selected file
       const newFiles = filePaths.map((filePath) => {
-        const fileName = filePath.split('/').pop() || filePath.split('\\').pop() || 'unknown';
+        const fileName = filePath.split(/[/\\]/).pop() || 'unknown';
         return {
           name: fileName,
           path: filePath,
@@ -455,7 +462,12 @@ export function ChatView() {
             mediaType: resizedBlob.type,
           });
         } catch (err) {
-          console.error('Failed to process dropped image:', err);
+          // Notify the user instead of silently dropping the error
+          setGlobalNotice({
+            id: `image-drop-failed-${Date.now()}`,
+            type: 'warning',
+            message: t('chat.imageProcessFailed'),
+          });
         }
       }
 
@@ -489,7 +501,7 @@ export function ChatView() {
       const loadConnectors = async () => {
         try {
           const statuses = await window.electronAPI.mcp.getServerStatus();
-          const active = statuses?.filter((s: any) => s.connected && s.toolCount > 0) || [];
+          const active = (statuses as Array<{ id: string; name: string; connected: boolean; toolCount: number }>)?.filter((s) => s.connected && s.toolCount > 0) || [];
           setActiveConnectors(active);
         } catch (err) {
           console.error('Failed to load MCP connectors:', err);
@@ -554,7 +566,7 @@ export function ChatView() {
           type: 'image',
           source: {
             type: 'base64',
-            media_type: img.mediaType as any,
+            media_type: img.mediaType as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
             data: img.base64,
           },
         });
@@ -717,7 +729,7 @@ export function ChatView() {
             {pastedImages.length > 0 && (
               <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2 mb-3">
                 {pastedImages.map((img, index) => (
-                  <div key={index} className="relative group">
+                  <div key={img.url || `pasted-image-${index}`} className="relative group">
                     <img
                       src={img.url}
                       alt={t('common.pastedImageAlt', { index: index + 1 })}
@@ -740,7 +752,7 @@ export function ChatView() {
               <div className="space-y-2 mb-3">
                 {attachedFiles.map((file, index) => (
                   <div
-                    key={index}
+                    key={file.path || `attached-file-${index}`}
                     className="flex items-center gap-2 px-3 py-2 rounded-lg bg-surface-muted border border-border group"
                   >
                     <div className="flex-1 min-w-0">

@@ -13,6 +13,7 @@ import type {
   PluginToggleResult,
 } from '../../renderer/types';
 import { log, logError } from '../utils/logger';
+import { isPathWithinRoot } from '../tools/path-containment';
 import { getDefaultShell } from '../utils/shell-resolver';
 import { pluginRegistryStore } from './plugin-registry-store';
 import { PluginCatalogService } from './plugin-catalog-service';
@@ -291,10 +292,11 @@ export class PluginRuntimeService {
 
   private static async defaultCommandRunner(command: string, args: string[]): Promise<CommandOutput> {
     // Enrich PATH for packaged app (same strategy as agent-runner)
-    let env = { ...process.env };
+    const env = { ...process.env };
     if (process.platform === 'darwin' || process.platform === 'linux') {
       try {
         const userShell = getDefaultShell();
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
         const { execSync } = require('child_process');
         const shellOutput = execSync(`${userShell} -l -c "echo $PATH"`, {
           encoding: 'utf-8',
@@ -304,6 +306,7 @@ export class PluginRuntimeService {
       } catch { /* use process.env.PATH */ }
     } else if (process.platform === 'win32') {
       try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
         const { execSync } = require('child_process');
         const winPath = execSync(
           'powershell.exe -NoProfile -Command "[Environment]::GetEnvironmentVariable(\'Path\', \'User\') + \';\' + [Environment]::GetEnvironmentVariable(\'Path\', \'Machine\')"',
@@ -649,6 +652,11 @@ export class PluginRuntimeService {
   }
 
   private resolveSafePath(rootPath: string, relativePath: string): string | null {
+    // Check for path traversal variants
+    // eslint-disable-next-line no-useless-escape
+    if (/(\.\.[\/\\]|%2e%2e)/i.test(relativePath)) {
+      throw new Error('Path traversal detected');
+    }
     const normalized = relativePath.trim().replace(/\\/g, '/').replace(/^\.\//, '');
     if (!normalized || normalized.startsWith('/') || normalized.startsWith('../') || normalized.includes('/../')) {
       return null;
@@ -693,7 +701,12 @@ export class PluginRuntimeService {
       if (entry.isDirectory()) {
         this.copyDirectory(sourceEntryPath, targetEntryPath);
       } else if (entry.isSymbolicLink()) {
+        // Validate symlink target is within allowed directory
         const linkTarget = fs.readlinkSync(sourceEntryPath);
+        const resolvedTarget = path.resolve(path.dirname(sourceEntryPath), linkTarget);
+        if (!isPathWithinRoot(resolvedTarget, sourcePath)) {
+          throw new Error(`Symlink target outside allowed directory: ${resolvedTarget}`);
+        }
         fs.symlinkSync(linkTarget, targetEntryPath);
       } else {
         fs.copyFileSync(sourceEntryPath, targetEntryPath);

@@ -1,6 +1,7 @@
-import Store from 'electron-store';
+import Store, { type Options as StoreOptions } from 'electron-store';
 import * as crypto from 'crypto';
-import { log } from '../utils/logger';
+import { log, logWarn } from '../utils/logger';
+import { getLegacyDerivedKeyBuffers, getStableDerivedKeyBuffer } from '../utils/store-encryption';
 
 /**
  * User Credential - stored information for automated login
@@ -31,48 +32,56 @@ interface StoredCredential extends Omit<UserCredential, 'password'> {
  */
 class CredentialsStore {
   private store: Store<{ credentials: StoredCredential[] }>;
-  private encryptionKey: Buffer;
+  private legacyKeyStore: Store<{ key?: string }>;
 
   constructor() {
-    const storeOptions: any = {
+    const storeOptions: StoreOptions<{ credentials: StoredCredential[] }> & { projectName?: string } = {
       name: 'credentials',
       projectName: 'open-cowork',
       defaults: {
         credentials: [],
       },
     };
-
     this.store = new Store<{ credentials: StoredCredential[] }>(storeOptions);
-
-    // Generate or retrieve encryption key
-    // In production, this should be derived from a master password or system keychain
-    this.encryptionKey = this.getOrCreateEncryptionKey();
+    this.legacyKeyStore = new Store<{ key?: string }>({ name: 'credentials-key' });
+    this.migrateLegacyPasswords();
   }
 
-  /**
-   * Get or create encryption key
-   * Stored separately from credentials for security
-   */
-  private getOrCreateEncryptionKey(): Buffer {
-    const keyStoreOptions: any = { name: 'credentials-key', projectName: 'open-cowork' };
-    const keyStore = new Store<{ key: string }>(keyStoreOptions);
-    let key = keyStore.get('key');
-    
-    if (!key) {
-      // Generate a new 256-bit key
-      key = crypto.randomBytes(32).toString('hex');
-      keyStore.set('key', key);
+  private static getPrimaryKey(): Buffer {
+    return getStableDerivedKeyBuffer({
+      moduleDirname: __dirname,
+      stableSeed: 'open-cowork-credentials-stable-v1',
+      legacySeed: 'open-cowork-credentials',
+      salt: 'open-cowork-salt',
+    });
+  }
+
+  private static getFallbackKeys(): Buffer[] {
+    return getLegacyDerivedKeyBuffers({
+      moduleDirname: __dirname,
+      stableSeed: 'open-cowork-credentials-stable-v1',
+      legacySeed: 'open-cowork-credentials',
+      salt: 'open-cowork-salt',
+    });
+  }
+
+  private getLegacyStoredKey(): Buffer | null {
+    const key = this.legacyKeyStore.get('key');
+    if (!key || typeof key !== 'string') {
+      return null;
     }
-    
-    return Buffer.from(key, 'hex');
+
+    try {
+      const buffer = Buffer.from(key, 'hex');
+      return buffer.length === 32 ? buffer : null;
+    } catch {
+      return null;
+    }
   }
 
-  /**
-   * Encrypt a password
-   */
-  private encrypt(text: string): { encrypted: string; iv: string } {
+  private encryptWithKey(text: string, key: Buffer): { encrypted: string; iv: string } {
     const iv = crypto.randomBytes(16);
-    const cipher = crypto.createCipheriv('aes-256-cbc', this.encryptionKey, iv);
+    const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
     let encrypted = cipher.update(text, 'utf8', 'hex');
     encrypted += cipher.final('hex');
     return {
@@ -81,37 +90,132 @@ class CredentialsStore {
     };
   }
 
-  /**
-   * Decrypt a password
-   */
-  private decrypt(encrypted: string, iv: string): string {
-    const decipher = crypto.createDecipheriv(
-      'aes-256-cbc',
-      this.encryptionKey,
-      Buffer.from(iv, 'hex')
-    );
+  private decryptWithKey(encrypted: string, iv: string, key: Buffer): string {
+    const decipher = crypto.createDecipheriv('aes-256-cbc', key, Buffer.from(iv, 'hex'));
     let decrypted = decipher.update(encrypted, 'hex', 'utf8');
     decrypted += decipher.final('utf8');
     return decrypted;
   }
 
+  private decryptWithFallback(
+    encrypted: string,
+    iv: string
+  ): { decrypted: string; needsRewrite: boolean } {
+    try {
+      return {
+        decrypted: this.decryptWithKey(encrypted, iv, CredentialsStore.getPrimaryKey()),
+        needsRewrite: false,
+      };
+    } catch {
+      const storedLegacyKey = this.getLegacyStoredKey();
+      if (storedLegacyKey) {
+        try {
+          return {
+            decrypted: this.decryptWithKey(encrypted, iv, storedLegacyKey),
+            needsRewrite: true,
+          };
+        } catch {
+          // Fall through to derived legacy keys.
+        }
+      }
+
+      for (const key of CredentialsStore.getFallbackKeys()) {
+        try {
+          return {
+            decrypted: this.decryptWithKey(encrypted, iv, key),
+            needsRewrite: true,
+          };
+        } catch {
+          // Try next legacy key candidate.
+        }
+      }
+    }
+
+    throw new Error('Failed to decrypt stored credential with both stable and legacy keys');
+  }
+
+  private migrateLegacyPasswords(): void {
+    const credentials = this.store.get('credentials', []);
+    let changed = false;
+    const primaryKey = CredentialsStore.getPrimaryKey();
+
+    const migrated = credentials.map((cred) => {
+      try {
+        const { decrypted, needsRewrite } = this.decryptWithFallback(cred.encryptedPassword, cred.iv);
+        if (!needsRewrite) {
+          return cred;
+        }
+
+        changed = true;
+        const next = this.encryptWithKey(decrypted, primaryKey);
+        return {
+          ...cred,
+          encryptedPassword: next.encrypted,
+          iv: next.iv,
+        };
+      } catch (error) {
+        logWarn('[CredentialsStore] Failed to migrate credential encryption', {
+          id: cred.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return cred;
+      }
+    });
+
+    if (changed) {
+      this.store.set('credentials', migrated);
+      log('[CredentialsStore] Migrated legacy credential encryption to stable key');
+    }
+  }
+
   /**
-   * Get all credentials (with decrypted passwords)
+   * Encrypt a password
+   */
+  private encrypt(text: string): { encrypted: string; iv: string } {
+    return this.encryptWithKey(text, CredentialsStore.getPrimaryKey());
+  }
+
+  /**
+   * Decrypt a password
+   */
+  private decrypt(encrypted: string, iv: string): string {
+    return this.decryptWithFallback(encrypted, iv).decrypted;
+  }
+
+  /**
+   * Get all credentials (with decrypted passwords).
+   * Credentials that fail decryption are skipped and logged rather than
+   * crashing the entire lookup — guards against a single corrupt entry
+   * making all credentials inaccessible.
    */
   getAll(): UserCredential[] {
     const stored = this.store.get('credentials', []);
-    return stored.map((cred) => ({
-      id: cred.id,
-      name: cred.name,
-      type: cred.type,
-      service: cred.service,
-      username: cred.username,
-      password: this.decrypt(cred.encryptedPassword, cred.iv),
-      url: cred.url,
-      notes: cred.notes,
-      createdAt: cred.createdAt,
-      updatedAt: cred.updatedAt,
-    }));
+    const results: UserCredential[] = [];
+
+    for (const cred of stored) {
+      try {
+        results.push({
+          id: cred.id,
+          name: cred.name,
+          type: cred.type,
+          service: cred.service,
+          username: cred.username,
+          password: this.decrypt(cred.encryptedPassword, cred.iv),
+          url: cred.url,
+          notes: cred.notes,
+          createdAt: cred.createdAt,
+          updatedAt: cred.updatedAt,
+        });
+      } catch (error) {
+        logWarn('[CredentialsStore] Skipping corrupt credential — decryption failed', {
+          id: cred.id,
+          name: cred.name,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    return results;
   }
 
   /**

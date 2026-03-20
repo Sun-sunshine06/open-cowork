@@ -17,7 +17,7 @@ import { join, resolve, dirname, isAbsolute, basename } from 'path';
 import * as fs from 'fs';
 import { execFileSync } from 'child_process';
 import { config } from 'dotenv';
-import { initDatabase } from './db/database';
+import { initDatabase, closeDatabase } from './db/database';
 import { SessionManager } from './session/session-manager';
 import { SkillsManager } from './skills/skills-manager';
 import { PluginCatalogService } from './skills/plugin-catalog-service';
@@ -172,12 +172,17 @@ async function waitForDevServer(url: string, maxAttempts = 30, intervalMs = 500)
 // Single-instance lock: skip in dev mode so vite-plugin-electron can restart freely
 // without the old process blocking the new one during async cleanup.
 const isDev = !!process.env.VITE_DEV_SERVER_URL;
+const ELECTRON_DEVTOOLS_DEBUG_PORT = '9223';
 
 // Enable Chrome DevTools Protocol in dev mode so the renderer can be inspected
-// via chrome://inspect or connected to by Puppeteer/Playwright at localhost:9222
+// via chrome://inspect or connected to by Puppeteer/Playwright at localhost:9223.
+// Chrome MCP uses 9222, so keep Electron on a separate port in development.
 if (isDev) {
-  app.commandLine.appendSwitch('remote-debugging-port', '9222');
-  app.commandLine.appendSwitch('remote-allow-origins', 'http://localhost:9222');
+  app.commandLine.appendSwitch('remote-debugging-port', ELECTRON_DEVTOOLS_DEBUG_PORT);
+  app.commandLine.appendSwitch(
+    'remote-allow-origins',
+    `http://localhost:${ELECTRON_DEVTOOLS_DEBUG_PORT}`
+  );
 }
 
 const hasSingleInstanceLock = isDev || app.requestSingleInstanceLock();
@@ -211,6 +216,8 @@ if (!hasSingleInstanceLock) {
 
 // Tray instance (kept alive to prevent GC)
 let tray: Tray | null = null;
+const DARK_BG = '#171614';
+const LIGHT_BG = '#f5f3ee';
 
 function buildMacMenu() {
   if (process.platform !== 'darwin') return;
@@ -275,16 +282,33 @@ function buildMacMenu() {
 function setupTray() {
   if (tray) return;
 
-  const iconName = process.platform === 'darwin' ? 'tray-iconTemplate.png' : 'tray-icon.png';
-  const iconPath = join(__dirname, '../../resources', iconName);
+  // Use .ico on Windows for proper multi-resolution tray support; fall back to .png if absent
+  const iconName =
+    process.platform === 'darwin'
+      ? 'tray-iconTemplate.png'
+      : process.platform === 'win32'
+        ? 'tray-icon.ico'
+        : 'tray-icon.png';
+  // TODO: create resources/tray-icon.ico from tray-icon.png for full Windows tray fidelity
+  const iconPath = app.isPackaged
+    ? join(process.resourcesPath, iconName)
+    : join(__dirname, '../../resources', iconName);
+
+  // On Windows, fall back to .png if the .ico file has not been created yet
+  const resolvedIconPath =
+    process.platform === 'win32' && !fs.existsSync(iconPath)
+      ? app.isPackaged
+        ? join(process.resourcesPath, 'tray-icon.png')
+        : join(__dirname, '../../resources', 'tray-icon.png')
+      : iconPath;
 
   // Gracefully skip tray if icon is missing (e.g. dev environment)
-  if (!fs.existsSync(iconPath)) {
-    log('[Tray] Icon not found at', iconPath, '— skipping tray setup');
+  if (!fs.existsSync(resolvedIconPath)) {
+    log('[Tray] Icon not found at', resolvedIconPath, '— skipping tray setup');
     return;
   }
 
-  tray = new Tray(iconPath);
+  tray = new Tray(resolvedIconPath);
   tray.setToolTip('Open Cowork');
 
   const contextMenu = Menu.buildFromTemplate([
@@ -360,13 +384,13 @@ function createWindow() {
   const effectiveTheme = resolveEffectiveTheme(savedTheme);
   const THEME = effectiveTheme === 'dark'
     ? {
-        background: '#171614',
-        titleBar: '#171614',
+        background: DARK_BG,
+        titleBar: DARK_BG,
         titleBarSymbol: '#f1ece4',
       }
     : {
-        background: '#f5f3ee',
-        titleBar: '#f5f3ee',
+        background: LIGHT_BG,
+        titleBar: LIGHT_BG,
         titleBarSymbol: '#1a1a1a',
       };
 
@@ -381,6 +405,12 @@ function createWindow() {
     minWidth: 800,
     minHeight: 600,
     backgroundColor: THEME.background,
+    icon: (() => {
+      const windowIconName = isMac ? 'icon.icns' : isWindows ? 'icon.ico' : 'icon.png';
+      return app.isPackaged
+        ? join(process.resourcesPath, windowIconName)
+        : join(__dirname, `../../resources/${windowIconName}`);
+    })(),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       nodeIntegration: false,
@@ -647,7 +677,7 @@ async function startSandboxBootstrap(): Promise<void> {
 
 // 发送事件到渲染进程（含远程会话拦截）
 function sendToRenderer(event: ServerEvent) {
-  const payload = 'payload' in event ? (event.payload as { sessionId?: string; [key: string]: any }) : undefined;
+  const payload = 'payload' in event ? (event.payload as { sessionId?: string; [key: string]: unknown }) : undefined;
   const sessionId = payload?.sessionId;
 
   // 判断是否远程会话
@@ -663,8 +693,8 @@ function sendToRenderer(event: ServerEvent) {
       if (message?.role === 'assistant' && message?.content) {
         // 提取助手文本内容
         const textContent = message.content
-          .filter((c: any) => c.type === 'text' && c.text)
-          .map((c: any) => c.text)
+          .filter((c) => c.type === 'text' && c.text)
+          .map((c) => c.text)
           .join('\n');
 
         if (textContent) {
@@ -720,9 +750,9 @@ function sendToRenderer(event: ServerEvent) {
       remoteManager
         .handlePermissionRequest(
           sessionId,
-          payload.toolUseId,
-          payload.toolName,
-          payload.input || {}
+          payload.toolUseId as string,
+          payload.toolName as string,
+          (payload.input as Record<string, unknown> | undefined) ?? {}
         )
         .then((result) => {
           if (result !== null && sessionManager) {
@@ -732,7 +762,7 @@ function sendToRenderer(event: ServerEvent) {
             } else {
               permissionResult = 'deny';
             }
-            sessionManager.handlePermissionResponse(payload.toolUseId!, permissionResult);
+            sessionManager.handlePermissionResponse(payload.toolUseId as string, permissionResult);
           }
         })
         .catch((err) => {
@@ -821,7 +851,7 @@ app
           click: () => mainWindow?.webContents.send('server-event', { type: 'navigate', payload: 'settings' }),
         },
       ]);
-      app.dock.setMenu(dockMenu);
+      app.dock?.setMenu(dockMenu);
     }
 
     // macOS: send initial system theme to renderer
@@ -840,6 +870,15 @@ app
         type: 'native-theme.changed',
         payload: { shouldUseDarkColors: nativeTheme.shouldUseDarkColors },
       });
+      if (
+        getSavedThemePreference() === 'system'
+        && mainWindow
+        && !mainWindow.isDestroyed()
+      ) {
+        mainWindow.setBackgroundColor(
+          nativeTheme.shouldUseDarkColors ? DARK_BG : LIGHT_BG
+        );
+      }
     });
 
     // Auto-updater: check for updates in production
@@ -881,6 +920,12 @@ app
           payload: { sessionId: started.id, updates: started },
         });
         return { sessionId: started.id };
+      },
+      onTaskError: (taskId, error) => {
+        sendToRenderer({
+          type: 'scheduled-task.error',
+          payload: { taskId, error },
+        });
       },
       now: () => Date.now(),
     });
@@ -948,6 +993,19 @@ app
 // Flag to prevent double cleanup
 let isCleaningUp = false;
 
+function withTimeout<T>(operation: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+  });
+
+  return Promise.race([operation, timeoutPromise]).finally(() => {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }) as Promise<T>;
+}
+
 /**
  * Cleanup all sandbox resources
  * Called on app quit (both Windows and macOS)
@@ -959,12 +1017,16 @@ async function cleanupSandboxResources(): Promise<void> {
   }
   isCleaningUp = true;
 
+  stopNavServer();
+  skillsManager?.stopStorageMonitoring();
   scheduledTaskManager?.stop();
+  tray?.destroy();
+  tray = null;
 
   // 停止远程控制
   try {
     log('[App] Stopping remote control...');
-    await remoteManager.stop();
+    await withTimeout(remoteManager.stop(), 5000, 'Remote control shutdown');
     log('[App] Remote control stopped');
   } catch (error) {
     logError('[App] Error stopping remote control:', error);
@@ -975,11 +1037,11 @@ async function cleanupSandboxResources(): Promise<void> {
     log('[App] Cleaning up all sandbox sessions...');
 
     // Cleanup WSL sessions
-    await SandboxSync.cleanupAllSessions();
+    await withTimeout(SandboxSync.cleanupAllSessions(), 30000, 'WSL session cleanup');
 
     // Cleanup Lima sessions
     const { LimaSync } = await import('./sandbox/lima-sync');
-    await LimaSync.cleanupAllSessions();
+    await withTimeout(LimaSync.cleanupAllSessions(), 30000, 'Lima session cleanup');
 
     log('[App] Sandbox sessions cleanup complete');
   } catch (error) {
@@ -988,11 +1050,31 @@ async function cleanupSandboxResources(): Promise<void> {
 
   // Shutdown sandbox adapter
   try {
-    await shutdownSandbox();
+    await withTimeout(shutdownSandbox(), 8000, 'Sandbox shutdown');
     log('[App] Sandbox shutdown complete');
   } catch (error) {
     logError('[App] Error shutting down sandbox:', error);
   }
+
+  // Shutdown MCP servers
+  try {
+    const mcpManager = sessionManager?.getMCPManager();
+    if (mcpManager) {
+      log('[App] Shutting down MCP servers...');
+      await withTimeout(mcpManager.shutdown(), 5000, 'MCP shutdown');
+      log('[App] MCP servers shutdown complete');
+    }
+  } catch (error) {
+    logError('[App] Error shutting down MCP servers:', error);
+  }
+
+  try {
+    closeDatabase();
+  } catch (error) {
+    logError('[App] Error closing database:', error);
+  }
+
+  closeLogFile();
 
   // pi-ai doesn't need proxy shutdown
 }
@@ -1003,7 +1085,6 @@ app.on('window-all-closed', async () => {
     // On Windows/Linux, closing all windows means quit.
     // On macOS dev mode, also quit — so vite-plugin-electron can restart cleanly
     // without the old process holding the single-instance lock.
-    skillsManager?.stopStorageMonitoring();
     await cleanupSandboxResources();
     app.quit();
   }
@@ -1021,14 +1102,14 @@ app.on('before-quit', async (event) => {
     // In dev mode, exit quickly — no need for async sandbox cleanup
     if (process.env.VITE_DEV_SERVER_URL) {
       stopNavServer();
+      try { closeDatabase(); } catch { /* best-effort */ }
       closeLogFile();
+      tray?.destroy();
+      tray = null;
       return;
     }
     event.preventDefault();
-    stopNavServer();
-    skillsManager?.stopStorageMonitoring();
     await cleanupSandboxResources();
-    closeLogFile(); // Close log file before quitting
     app.quit();
   }
 });
@@ -1051,11 +1132,21 @@ ipcMain.handle('client-invoke', async (_event, data: ClientEvent) => {
 });
 
 ipcMain.handle('get-version', () => {
-  return app.getVersion();
+  try {
+    return app.getVersion();
+  } catch (error) {
+    logError('[IPC] Error getting version:', error);
+    return 'unknown';
+  }
 });
 
 ipcMain.handle('system.getTheme', () => {
-  return { shouldUseDarkColors: nativeTheme.shouldUseDarkColors };
+  try {
+    return { shouldUseDarkColors: nativeTheme.shouldUseDarkColors };
+  } catch (error) {
+    logError('[IPC] Error getting theme:', error);
+    return { shouldUseDarkColors: true };
+  }
 });
 
 ipcMain.handle('shell.openExternal', async (_event, url: string) => {
@@ -1266,11 +1357,21 @@ ipcMain.handle('dialog.selectFiles', async () => {
 
 // Config IPC handlers
 ipcMain.handle('config.get', () => {
-  return configStore.getAll();
+  try {
+    return configStore.getAll();
+  } catch (error) {
+    logError('[Config] Error getting config:', error);
+    return {};
+  }
 });
 
 ipcMain.handle('config.getPresets', () => {
-  return getPiAiModelPresets();
+  try {
+    return getPiAiModelPresets();
+  } catch (error) {
+    logError('[Config] Error getting presets:', error);
+    return [];
+  }
 });
 
 const buildAgentRuntimeSignature = (config: AppConfig): string =>
@@ -1369,7 +1470,12 @@ ipcMain.handle('config.switchSet', async (_event, payload: { id: string }) => {
 });
 
 ipcMain.handle('config.isConfigured', () => {
-  return configStore.isConfigured();
+  try {
+    return configStore.isConfigured();
+  } catch (error) {
+    logError('[Config] Error checking configured status:', error);
+    return false;
+  }
 });
 
 ipcMain.handle('config.test', async (_event, payload: ApiTestInput): Promise<ApiTestResult> => {
@@ -1399,22 +1505,25 @@ ipcMain.handle(
 );
 
 ipcMain.handle('config.diagnose', async (_event, payload: DiagnosticInput) => {
-  const { runDiagnostics } = await import('./config/api-diagnostics');
-  return runDiagnostics(payload);
+  try {
+    const { runDiagnostics } = await import('./config/api-diagnostics');
+    return await runDiagnostics(payload);
+  } catch (error) {
+    logError('[Config] Error running diagnostics:', error);
+    throw error;
+  }
 });
 
 ipcMain.handle('config.discover-local', async (_event, payload?: { baseUrl?: string }) => {
-  const { discoverLocalOllama } = await import('./config/api-diagnostics');
-  return discoverLocalOllama(payload);
+  try {
+    const { discoverLocalOllama } = await import('./config/api-diagnostics');
+    return await discoverLocalOllama(payload);
+  } catch (error) {
+    logError('[Config] Error discovering local services:', error);
+    return [];
+  }
 });
 
-ipcMain.handle('auth.getStatus', () => {
-  return [];
-});
-
-ipcMain.handle('auth.importToken', () => {
-  return null;
-});
 
 // MCP Server IPC handlers
 ipcMain.handle('mcp.getServers', () => {
@@ -1515,7 +1624,11 @@ ipcMain.handle('credentials.getAll', () => {
 
 ipcMain.handle('credentials.getById', (_event, id: string) => {
   try {
-    return credentialsStore.getById(id);
+    const cred = credentialsStore.getById(id);
+    if (!cred) return undefined;
+    // Strip password field before sending to renderer
+    const safeCred = { ...cred, password: undefined };
+    return safeCred;
   } catch (error) {
     logError('[Credentials] Error getting credential:', error);
     return undefined;
@@ -1524,7 +1637,9 @@ ipcMain.handle('credentials.getById', (_event, id: string) => {
 
 ipcMain.handle('credentials.getByType', (_event, type: UserCredential['type']) => {
   try {
-    return credentialsStore.getByType(type);
+    const creds = credentialsStore.getByType(type);
+    // Strip password field before sending to renderer
+    return creds.map(c => ({ ...c, password: undefined }));
   } catch (error) {
     logError('[Credentials] Error getting credentials by type:', error);
     return [];
@@ -1533,7 +1648,9 @@ ipcMain.handle('credentials.getByType', (_event, type: UserCredential['type']) =
 
 ipcMain.handle('credentials.getByService', (_event, service: string) => {
   try {
-    return credentialsStore.getByService(service);
+    const creds = credentialsStore.getByService(service);
+    // Strip password field before sending to renderer
+    return creds.map(c => ({ ...c, password: undefined }));
   } catch (error) {
     logError('[Credentials] Error getting credentials by service:', error);
     return [];
@@ -1646,10 +1763,15 @@ ipcMain.handle('skills.validate', async (_event, skillPath: string) => {
 });
 
 ipcMain.handle('skills.getStoragePath', async () => {
-  if (!skillsManager) {
-    throw new Error('SkillsManager not initialized');
+  try {
+    if (!skillsManager) {
+      return null;
+    }
+    return skillsManager.getGlobalSkillsPath();
+  } catch (error) {
+    logError('[Skills] Error getting storage path:', error);
+    return null;
   }
-  return skillsManager.getGlobalSkillsPath();
 });
 
 ipcMain.handle('skills.setStoragePath', async (_event, targetPath: string, migrate = true) => {
@@ -1769,61 +1891,34 @@ ipcMain.handle('plugins.uninstall', async (_event, pluginId: string) => {
   }
 });
 
-ipcMain.handle('skills.listPlugins', async (_event, installableOnly?: boolean) => {
-  try {
-    logWarn('[Skills] skills.listPlugins is deprecated. Use plugins.listCatalog instead.');
-    if (!pluginRuntimeService) {
-      throw new Error('PluginRuntimeService not initialized');
-    }
-    const plugins = await pluginRuntimeService.listCatalog({
-      installableOnly: installableOnly === true,
-    });
-    return plugins.map((plugin) => ({
-      ...plugin,
-      skillCount: plugin.componentCounts.skills,
-      hasSkills: plugin.componentCounts.skills > 0,
-    }));
-  } catch (error) {
-    logError('[Skills] Error listing plugins:', error);
-    throw error;
-  }
-});
-
-ipcMain.handle('skills.installPlugin', async (_event, pluginName: string) => {
-  try {
-    logWarn('[Skills] skills.installPlugin is deprecated. Use plugins.install instead.');
-    if (!pluginRuntimeService) {
-      throw new Error('PluginRuntimeService not initialized');
-    }
-    const result = await pluginRuntimeService.install(pluginName);
-    sessionManager?.invalidateSkillsSetup();
-    return {
-      pluginName: result.plugin.name,
-      installedSkills: result.installedSkills,
-      skippedSkills: [],
-      errors: result.warnings,
-    };
-  } catch (error) {
-    logError('[Skills] Error installing plugin:', error);
-    throw error;
-  }
-});
 
 // Window control IPC handlers
 ipcMain.on('window.minimize', () => {
-  mainWindow?.minimize();
+  try {
+    mainWindow?.minimize();
+  } catch (error) {
+    logError('[Window] Error minimizing:', error);
+  }
 });
 
 ipcMain.on('window.maximize', () => {
-  if (mainWindow?.isMaximized()) {
-    mainWindow.unmaximize();
-  } else {
-    mainWindow?.maximize();
+  try {
+    if (mainWindow?.isMaximized()) {
+      mainWindow.unmaximize();
+    } else {
+      mainWindow?.maximize();
+    }
+  } catch (error) {
+    logError('[Window] Error maximizing:', error);
   }
 });
 
 ipcMain.on('window.close', () => {
-  mainWindow?.close();
+  try {
+    mainWindow?.close();
+  } catch (error) {
+    logError('[Window] Error closing:', error);
+  }
 });
 
 // Sandbox IPC handlers
@@ -1898,14 +1993,6 @@ ipcMain.handle('sandbox.installPythonInWSL', async (_event, distro: string) => {
   }
 });
 
-ipcMain.handle('sandbox.installClaudeCodeInWSL', async (_event, distro: string) => {
-  try {
-    return await WSLBridge.installClaudeCodeInWSL(distro);
-  } catch (error) {
-    logError('[Sandbox] Error installing claude-code:', error);
-    return false;
-  }
-});
 
 // Lima IPC handlers (macOS)
 ipcMain.handle('sandbox.checkLima', async () => {
@@ -1962,14 +2049,6 @@ ipcMain.handle('sandbox.installPythonInLima', async () => {
   }
 });
 
-ipcMain.handle('sandbox.installClaudeCodeInLima', async () => {
-  try {
-    return await LimaBridge.installClaudeCodeInLima();
-  } catch (error) {
-    logError('[Sandbox] Error installing claude-code in Lima:', error);
-    return false;
-  }
-});
 
 // Logs IPC handlers
 ipcMain.handle('logs.getPath', () => {
@@ -2351,8 +2430,13 @@ ipcMain.handle('remote.restart', async () => {
 });
 
 ipcMain.handle('schedule.list', () => {
-  if (!scheduledTaskManager) return [];
-  return scheduledTaskManager.list();
+  try {
+    if (!scheduledTaskManager) return [];
+    return scheduledTaskManager.list();
+  } catch (error) {
+    logError('[Schedule] Error listing tasks:', error);
+    return [];
+  }
 });
 
 ipcMain.handle('schedule.create', async (_event, payload: ScheduledTaskCreateInput) => {
@@ -2423,7 +2507,7 @@ ipcMain.handle('schedule.runNow', async (_event, id: string) => {
   return scheduledTaskManager.runNow(id);
 });
 
-ipcMain.handle('logs.write', (_event, level: 'info' | 'warn' | 'error', args: any[]) => {
+ipcMain.handle('logs.write', (_event, level: 'info' | 'warn' | 'error', args: unknown[]) => {
   try {
     if (level === 'warn') {
       logWarn(...args);
@@ -2614,7 +2698,7 @@ async function handleClientEvent(event: ClientEvent): Promise<unknown> {
         if (mainWindow && !mainWindow.isDestroyed()) {
           const effectiveTheme = resolveEffectiveTheme(nextTheme);
           mainWindow.setBackgroundColor(
-            effectiveTheme === 'dark' ? '#171614' : '#f5f3ee'
+            effectiveTheme === 'dark' ? DARK_BG : LIGHT_BG
           );
         }
         sendToRenderer({

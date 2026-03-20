@@ -48,9 +48,10 @@ export class ThinkTagStreamParser {
         }
 
         case 'pending_open': {
-          this.buffer += ch;
-          if (OPEN_TAG.startsWith(this.buffer)) {
+          const candidate = this.buffer + ch;
+          if (OPEN_TAG.startsWith(candidate)) {
             // Still a valid prefix of <think>
+            this.buffer = candidate;
             if (this.buffer === OPEN_TAG) {
               // Full match — enter think mode
               this.state = 'think';
@@ -62,6 +63,7 @@ export class ThinkTagStreamParser {
             text += this.buffer;
             this.buffer = '';
             this.state = 'text';
+            i--; // Reprocess current character
           }
           break;
         }
@@ -77,8 +79,9 @@ export class ThinkTagStreamParser {
         }
 
         case 'pending_close': {
-          this.buffer += ch;
-          if (CLOSE_TAG.startsWith(this.buffer)) {
+          const candidate = this.buffer + ch;
+          if (CLOSE_TAG.startsWith(candidate)) {
+            this.buffer = candidate;
             if (this.buffer === CLOSE_TAG) {
               // Full match — exit think mode
               this.state = 'text';
@@ -89,6 +92,7 @@ export class ThinkTagStreamParser {
             thinking += this.buffer;
             this.buffer = '';
             this.state = 'think';
+            i--; // Reprocess current character
           }
           break;
         }

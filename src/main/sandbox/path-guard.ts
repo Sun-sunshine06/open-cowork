@@ -100,9 +100,15 @@ export class PathGuard {
       return { allowed: true };
     }
 
-    // Allow global npm modules
+    // Allow global npm modules only within sandbox or system paths
     if (normalizedPath.includes('/node_modules/')) {
-      return { allowed: true };
+      if (isPathWithinRoot(normalizedPath, session.sandboxPath) ||
+          normalizedPath.startsWith('/root/.nvm/') ||
+          normalizedPath.startsWith('/usr/lib/node_modules/') ||
+          normalizedPath.startsWith('/usr/local/lib/node_modules/')) {
+        return { allowed: true };
+      }
+      // node_modules outside of known safe paths is not auto-allowed
     }
 
     // Check forbidden patterns
@@ -156,13 +162,13 @@ export class PathGuard {
     }
 
     // Check for Windows-style paths that weren't converted
-    if (/[A-Za-z]:[\\\/]/.test(command)) {
+    if (/[A-Za-z]:[/\\]/.test(command)) {
       // This shouldn't happen if paths are properly converted, but log it
       log(`[PathGuard] Windows path detected in command, needs conversion`);
     }
 
-    // Wrap the command to ensure it runs in the sandbox directory
-    const sanitizedCommand = `cd "${session.sandboxPath}" && ${command}`;
+    // The caller should use `cwd` option in `spawn` instead of `cd`
+    const sanitizedCommand = command;
 
     return {
       allowed: true,
@@ -189,9 +195,9 @@ export class PathGuard {
     let convertedCommand = command;
 
     // Pattern to match quoted Windows paths with spaces: "C:\foo bar\baz.txt"
-    const quotedWindowsPathPattern = /(["'])([A-Za-z]:[\\\/][^"']+)\1/g;
+    const quotedWindowsPathPattern = /(["'])([A-Za-z]:[/\\][^"']+)\1/g;
     // Pattern to match Windows paths: D:\something or D:/something
-    const windowsPathPattern = /([A-Za-z]:[\\\/][^\s;|&"'<>]*)/g;
+    const windowsPathPattern = /([A-Za-z]:[/\\][^\s;|&"'<>]*)/g;
 
     const convertWindowsPath = (originalPath: string, originalMatch: string): string => {
       const originalFullPath = originalPath.replace(/\\/g, '/');

@@ -18,6 +18,7 @@ import chokidar, { type FSWatcher } from 'chokidar';
 import type { Skill, PluginInstallResult } from '../../renderer/types';
 import type { DatabaseInstance } from '../db/database';
 import { log, logError, logWarn } from '../utils/logger';
+import { isPathWithinRoot } from '../tools/path-containment';
 
 interface McpServerConfig {
   command: string;
@@ -69,7 +70,7 @@ export interface SetGlobalSkillsPathResult {
 export class SkillsManager {
   private db: DatabaseInstance;
   private loadedSkills: Map<string, Skill> = new Map();
-  private runningServers: Map<string, { process: any; skill: Skill }> = new Map();
+  private runningServers: Map<string, { process: unknown; skill: Skill }> = new Map();
   private getConfiguredGlobalSkillsPathFn?: () => string | undefined;
   private setConfiguredGlobalSkillsPathFn?: (nextPath: string) => void;
   private watchStorageEnabled: boolean;
@@ -166,6 +167,16 @@ export class SkillsManager {
     const fallbackPath = this.getDefaultGlobalSkillsPath();
     const configuredPath = (this.getConfiguredGlobalSkillsPathFn?.() || '').trim();
     const preferredPath = configuredPath ? path.resolve(configuredPath) : fallbackPath;
+
+    // Validate resolved path is within expected directories
+    if (configuredPath) {
+      const resolved = path.resolve(configuredPath);
+      const allowedBases = [app.getPath('userData'), app.getPath('home'), process.cwd()];
+      const isWithinAllowed = allowedBases.some(base => isPathWithinRoot(resolved, base));
+      if (!isWithinAllowed) {
+        throw new Error(`Skills path outside allowed directories: ${resolved}`);
+      }
+    }
 
     try {
       if (!fs.existsSync(preferredPath)) {

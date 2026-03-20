@@ -8,10 +8,8 @@ import type {
   Skill,
   ApiTestInput,
   ApiTestResult,
-  PluginCatalogItem,
   PluginCatalogItemV2,
   InstalledPlugin,
-  PluginInstallResult,
   PluginInstallResultV2,
   PluginToggleResult,
   PluginComponentKind,
@@ -19,8 +17,24 @@ import type {
   ScheduleCreateInput,
   ScheduleUpdateInput,
   ProviderModelInfo,
+  LocalOllamaDiscoveryResult,
 } from '../renderer/types';
 import type { DiagnosticInput, DiagnosticResult } from '../renderer/types';
+import type {
+  McpServerConfig,
+  McpTool,
+  McpServerStatus,
+  McpPresetsMap,
+  CredentialRecord,
+  CredentialSaveInput,
+  CredentialUpdateInput,
+  RemoteConfig,
+  GatewayConfig,
+  FeishuChannelConfig,
+  PairedUser,
+  PairingRequest,
+  RemoteSessionMapping,
+} from '../shared/ipc-types';
 
 // Track registered callbacks to prevent duplicate listeners
 let registeredCallback: ((event: ServerEvent) => void) | null = null;
@@ -117,13 +131,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('config.listModels', payload),
     diagnose: (input: DiagnosticInput): Promise<DiagnosticResult> =>
       ipcRenderer.invoke('config.diagnose', input),
-    discoverLocal: (payload?: { baseUrl?: string }): Promise<{ available: boolean; baseUrl: string; models?: string[]; status: 'unavailable' | 'service_available' | 'model_usable' | 'model_unusable'; probeModel?: string; probeError?: string }> =>
+    discoverLocal: (payload?: { baseUrl?: string }): Promise<LocalOllamaDiscoveryResult> =>
       ipcRenderer.invoke('config.discover-local', payload),
-  },
-
-  auth: {
-    getStatus: (): Promise<Array<Record<string, unknown>>> => ipcRenderer.invoke('auth.getStatus'),
-    importToken: (provider: string): Promise<Record<string, unknown> | null> => ipcRenderer.invoke('auth.importToken', provider),
   },
 
   // Window control methods
@@ -135,25 +144,28 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // MCP methods
   mcp: {
-    getServers: (): Promise<any[]> => ipcRenderer.invoke('mcp.getServers'),
-    getServer: (serverId: string): Promise<any> => ipcRenderer.invoke('mcp.getServer', serverId),
-    saveServer: (config: any): Promise<{ success: boolean }> => 
+    getServers: (): Promise<McpServerConfig[]> => ipcRenderer.invoke('mcp.getServers'),
+    getServer: (serverId: string): Promise<McpServerConfig | undefined> => ipcRenderer.invoke('mcp.getServer', serverId),
+    saveServer: (config: McpServerConfig): Promise<{ success: boolean }> =>
       ipcRenderer.invoke('mcp.saveServer', config),
-    deleteServer: (serverId: string): Promise<{ success: boolean }> => 
+    deleteServer: (serverId: string): Promise<{ success: boolean }> =>
       ipcRenderer.invoke('mcp.deleteServer', serverId),
-    getTools: (): Promise<any[]> => ipcRenderer.invoke('mcp.getTools'),
-    getServerStatus: (): Promise<any[]> => ipcRenderer.invoke('mcp.getServerStatus'),
-    getPresets: (): Promise<Record<string, any>> => ipcRenderer.invoke('mcp.getPresets'),
+    getTools: (): Promise<McpTool[]> => ipcRenderer.invoke('mcp.getTools'),
+    getServerStatus: (): Promise<McpServerStatus[]> => ipcRenderer.invoke('mcp.getServerStatus'),
+    getPresets: (): Promise<McpPresetsMap> => ipcRenderer.invoke('mcp.getPresets'),
   },
 
   // Credentials methods
+  // Security: getById, getByType, and getByService intentionally do NOT return
+  // the password field. Passwords are stripped by the main process IPC handlers
+  // so the renderer process never has access to plaintext passwords.
   credentials: {
-    getAll: (): Promise<any[]> => ipcRenderer.invoke('credentials.getAll'),
-    getById: (id: string): Promise<any> => ipcRenderer.invoke('credentials.getById', id),
-    getByType: (type: string): Promise<any[]> => ipcRenderer.invoke('credentials.getByType', type),
-    getByService: (service: string): Promise<any[]> => ipcRenderer.invoke('credentials.getByService', service),
-    save: (credential: any): Promise<any> => ipcRenderer.invoke('credentials.save', credential),
-    update: (id: string, updates: any): Promise<any> => ipcRenderer.invoke('credentials.update', id, updates),
+    getAll: (): Promise<CredentialRecord[]> => ipcRenderer.invoke('credentials.getAll'),
+    getById: (id: string): Promise<CredentialRecord | undefined> => ipcRenderer.invoke('credentials.getById', id),
+    getByType: (type: string): Promise<CredentialRecord[]> => ipcRenderer.invoke('credentials.getByType', type),
+    getByService: (service: string): Promise<CredentialRecord[]> => ipcRenderer.invoke('credentials.getByService', service),
+    save: (credential: CredentialSaveInput): Promise<CredentialRecord> => ipcRenderer.invoke('credentials.save', credential),
+    update: (id: string, updates: CredentialUpdateInput): Promise<CredentialRecord | undefined> => ipcRenderer.invoke('credentials.update', id, updates),
     delete: (id: string): Promise<boolean> => ipcRenderer.invoke('credentials.delete', id),
   },
 
@@ -177,10 +189,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('skills.setStoragePath', targetPath, migrate),
     openStoragePath: (): Promise<{ success: boolean; path: string; error?: string }> =>
       ipcRenderer.invoke('skills.openStoragePath'),
-    listPlugins: (installableOnly = false): Promise<PluginCatalogItem[]> =>
-      ipcRenderer.invoke('skills.listPlugins', installableOnly),
-    installPlugin: (pluginName: string): Promise<PluginInstallResult> =>
-      ipcRenderer.invoke('skills.installPlugin', pluginName),
   },
 
   plugins: {
@@ -255,16 +263,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
     }> => ipcRenderer.invoke('sandbox.checkLima'),
     installNodeInWSL: (distro: string): Promise<boolean> => 
       ipcRenderer.invoke('sandbox.installNodeInWSL', distro),
-    installPythonInWSL: (distro: string): Promise<boolean> => 
+    installPythonInWSL: (distro: string): Promise<boolean> =>
       ipcRenderer.invoke('sandbox.installPythonInWSL', distro),
-    installClaudeCodeInWSL: (distro: string): Promise<boolean> => 
-      ipcRenderer.invoke('sandbox.installClaudeCodeInWSL', distro),
-    installNodeInLima: (): Promise<boolean> => 
+    installNodeInLima: (): Promise<boolean> =>
       ipcRenderer.invoke('sandbox.installNodeInLima'),
-    installPythonInLima: (): Promise<boolean> => 
+    installPythonInLima: (): Promise<boolean> =>
       ipcRenderer.invoke('sandbox.installPythonInLima'),
-    installClaudeCodeInLima: (): Promise<boolean> => 
-      ipcRenderer.invoke('sandbox.installClaudeCodeInLima'),
     startLimaInstance: (): Promise<boolean> =>
       ipcRenderer.invoke('sandbox.startLimaInstance'),
     stopLimaInstance: (): Promise<boolean> =>
@@ -291,13 +295,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('logs.setEnabled', enabled),
     isEnabled: (): Promise<{ success: boolean; enabled?: boolean; error?: string }> =>
       ipcRenderer.invoke('logs.isEnabled'),
-    write: (level: 'info' | 'warn' | 'error', ...args: any[]): Promise<{ success: boolean; error?: string }> =>
+    write: (level: 'info' | 'warn' | 'error', ...args: unknown[]): Promise<{ success: boolean; error?: string }> =>
       ipcRenderer.invoke('logs.write', level, args),
   },
 
   // Remote control methods
   remote: {
-    getConfig: (): Promise<any> => ipcRenderer.invoke('remote.getConfig'),
+    getConfig: (): Promise<RemoteConfig> => ipcRenderer.invoke('remote.getConfig'),
     getStatus: (): Promise<{
       running: boolean;
       port?: number;
@@ -308,17 +312,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
     }> => ipcRenderer.invoke('remote.getStatus'),
     setEnabled: (enabled: boolean): Promise<{ success: boolean; error?: string }> =>
       ipcRenderer.invoke('remote.setEnabled', enabled),
-    updateGatewayConfig: (config: any): Promise<{ success: boolean; error?: string }> =>
+    updateGatewayConfig: (config: Partial<GatewayConfig>): Promise<{ success: boolean; error?: string }> =>
       ipcRenderer.invoke('remote.updateGatewayConfig', config),
-    updateFeishuConfig: (config: any): Promise<{ success: boolean; error?: string }> =>
+    updateFeishuConfig: (config: FeishuChannelConfig): Promise<{ success: boolean; error?: string }> =>
       ipcRenderer.invoke('remote.updateFeishuConfig', config),
-    getPairedUsers: (): Promise<any[]> => ipcRenderer.invoke('remote.getPairedUsers'),
-    getPendingPairings: (): Promise<any[]> => ipcRenderer.invoke('remote.getPendingPairings'),
+    getPairedUsers: (): Promise<PairedUser[]> => ipcRenderer.invoke('remote.getPairedUsers'),
+    getPendingPairings: (): Promise<PairingRequest[]> => ipcRenderer.invoke('remote.getPendingPairings'),
     approvePairing: (channelType: string, userId: string): Promise<{ success: boolean; error?: string }> =>
       ipcRenderer.invoke('remote.approvePairing', channelType, userId),
     revokePairing: (channelType: string, userId: string): Promise<{ success: boolean; error?: string }> =>
       ipcRenderer.invoke('remote.revokePairing', channelType, userId),
-    getRemoteSessions: (): Promise<any[]> => ipcRenderer.invoke('remote.getRemoteSessions'),
+    getRemoteSessions: (): Promise<RemoteSessionMapping[]> => ipcRenderer.invoke('remote.getRemoteSessions'),
     clearRemoteSession: (sessionId: string): Promise<{ success: boolean; error?: string }> =>
       ipcRenderer.invoke('remote.clearRemoteSession', sessionId),
     getTunnelStatus: (): Promise<{
@@ -379,11 +383,7 @@ declare global {
         test: (config: ApiTestInput) => Promise<ApiTestResult>;
         listModels: (payload: { provider: AppConfig['provider']; apiKey: string; baseUrl?: string }) => Promise<ProviderModelInfo[]>;
         diagnose: (input: DiagnosticInput) => Promise<DiagnosticResult>;
-        discoverLocal: (payload?: { baseUrl?: string }) => Promise<{ available: boolean; baseUrl: string; models?: string[]; status: 'unavailable' | 'service_available' | 'model_usable' | 'model_unusable'; probeModel?: string; probeError?: string }>;
-      };
-      auth: {
-        getStatus: () => Promise<Array<Record<string, unknown>>>;
-        importToken: (provider: string) => Promise<Record<string, unknown> | null>;
+        discoverLocal: (payload?: { baseUrl?: string }) => Promise<LocalOllamaDiscoveryResult>;
       };
       window: {
         minimize: () => void;
@@ -391,21 +391,21 @@ declare global {
         close: () => void;
       };
       mcp: {
-        getServers: () => Promise<any[]>;
-        getServer: (serverId: string) => Promise<any>;
-        saveServer: (config: any) => Promise<{ success: boolean }>;
+        getServers: () => Promise<McpServerConfig[]>;
+        getServer: (serverId: string) => Promise<McpServerConfig | undefined>;
+        saveServer: (config: McpServerConfig) => Promise<{ success: boolean }>;
         deleteServer: (serverId: string) => Promise<{ success: boolean }>;
-        getTools: () => Promise<any[]>;
-        getServerStatus: () => Promise<any[]>;
-        getPresets: () => Promise<Record<string, any>>;
+        getTools: () => Promise<McpTool[]>;
+        getServerStatus: () => Promise<McpServerStatus[]>;
+        getPresets: () => Promise<McpPresetsMap>;
       };
       credentials: {
-        getAll: () => Promise<any[]>;
-        getById: (id: string) => Promise<any>;
-        getByType: (type: string) => Promise<any[]>;
-        getByService: (service: string) => Promise<any[]>;
-        save: (credential: any) => Promise<any>;
-        update: (id: string, updates: any) => Promise<any>;
+        getAll: () => Promise<CredentialRecord[]>;
+        getById: (id: string) => Promise<CredentialRecord | undefined>;
+        getByType: (type: string) => Promise<CredentialRecord[]>;
+        getByService: (service: string) => Promise<CredentialRecord[]>;
+        save: (credential: CredentialSaveInput) => Promise<CredentialRecord>;
+        update: (id: string, updates: CredentialUpdateInput) => Promise<CredentialRecord | undefined>;
         delete: (id: string) => Promise<boolean>;
       };
       skills: {
@@ -420,8 +420,6 @@ declare global {
           migrate?: boolean
         ) => Promise<{ success: boolean; path: string; migratedCount: number; skippedCount: number; error?: string }>;
         openStoragePath: () => Promise<{ success: boolean; path: string; error?: string }>;
-        listPlugins: (installableOnly?: boolean) => Promise<PluginCatalogItem[]>;
-        installPlugin: (pluginName: string) => Promise<PluginInstallResult>;
       };
       plugins: {
         listCatalog: (options?: { installableOnly?: boolean }) => Promise<PluginCatalogItemV2[]>;
@@ -488,10 +486,8 @@ declare global {
         }>;
         installNodeInWSL: (distro: string) => Promise<boolean>;
         installPythonInWSL: (distro: string) => Promise<boolean>;
-        installClaudeCodeInWSL: (distro: string) => Promise<boolean>;
         installNodeInLima: () => Promise<boolean>;
         installPythonInLima: () => Promise<boolean>;
-        installClaudeCodeInLima: () => Promise<boolean>;
         startLimaInstance: () => Promise<boolean>;
         stopLimaInstance: () => Promise<boolean>;
         retrySetup: () => Promise<{ success: boolean; error?: string; result?: unknown }>;
@@ -506,10 +502,10 @@ declare global {
         clear: () => Promise<{ success: boolean; deletedCount?: number; error?: string }>;
         setEnabled: (enabled: boolean) => Promise<{ success: boolean; enabled?: boolean; error?: string }>;
         isEnabled: () => Promise<{ success: boolean; enabled?: boolean; error?: string }>;
-        write: (level: 'info' | 'warn' | 'error', ...args: any[]) => Promise<{ success: boolean; error?: string }>;
+        write: (level: 'info' | 'warn' | 'error', ...args: unknown[]) => Promise<{ success: boolean; error?: string }>;
       };
       remote: {
-        getConfig: () => Promise<any>;
+        getConfig: () => Promise<RemoteConfig>;
         getStatus: () => Promise<{
           running: boolean;
           port?: number;
@@ -519,13 +515,13 @@ declare global {
           pendingPairings: number;
         }>;
         setEnabled: (enabled: boolean) => Promise<{ success: boolean; error?: string }>;
-        updateGatewayConfig: (config: any) => Promise<{ success: boolean; error?: string }>;
-        updateFeishuConfig: (config: any) => Promise<{ success: boolean; error?: string }>;
-        getPairedUsers: () => Promise<any[]>;
-        getPendingPairings: () => Promise<any[]>;
+        updateGatewayConfig: (config: Partial<GatewayConfig>) => Promise<{ success: boolean; error?: string }>;
+        updateFeishuConfig: (config: FeishuChannelConfig) => Promise<{ success: boolean; error?: string }>;
+        getPairedUsers: () => Promise<PairedUser[]>;
+        getPendingPairings: () => Promise<PairingRequest[]>;
         approvePairing: (channelType: string, userId: string) => Promise<{ success: boolean; error?: string }>;
         revokePairing: (channelType: string, userId: string) => Promise<{ success: boolean; error?: string }>;
-        getRemoteSessions: () => Promise<any[]>;
+        getRemoteSessions: () => Promise<RemoteSessionMapping[]>;
         clearRemoteSession: (sessionId: string) => Promise<{ success: boolean; error?: string }>;
         getTunnelStatus: () => Promise<{
           connected: boolean;

@@ -3,9 +3,10 @@
  * WebSocket 控制平面，管理远程连接和消息路由
  */
 
+import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 import { WebSocketServer, WebSocket } from 'ws';
-import { createServer, Server as HttpServer, IncomingMessage } from 'http';
+import { createServer, Server as HttpServer, IncomingMessage, ServerResponse } from 'http';
 import { log, logError, logWarn } from '../utils/logger';
 import type {
   GatewayConfig,
@@ -27,6 +28,7 @@ interface WSClient {
   authenticated: boolean;
   userId?: string;
   connectedAt: number;
+  ip: string;
 }
 
 // WebSocket message protocol
@@ -49,6 +51,9 @@ export class RemoteGateway extends EventEmitter {
   private pairedUsers: Map<string, PairedUser> = new Map();
   
   private _running: boolean = false;
+
+  // Rate limiting for WebSocket auth
+  private authAttempts: Map<string, { count: number; resetTime: number }> = new Map();
   
   constructor(config: GatewayConfig, messageRouter: MessageRouter) {
     super();
@@ -127,7 +132,7 @@ export class RemoteGateway extends EventEmitter {
    * Stop the gateway
    */
   async stop(): Promise<void> {
-    if (!this._running) {
+    if (!this._running && !this.httpServer && !this.wss) {
       return;
     }
     
@@ -345,10 +350,11 @@ export class RemoteGateway extends EventEmitter {
         }
         return allowlist.includes(message.sender.id);
         
-      case 'pairing':
+      case 'pairing': {
         // Check if user is paired
         const pairedKey = `${message.channelType}:${message.sender.id}`;
         return this.pairedUsers.has(pairedKey);
+      }
         
       default:
         return false;
@@ -528,14 +534,14 @@ export class RemoteGateway extends EventEmitter {
    * Generate 6-digit pairing code
    */
   private generatePairingCode(): string {
-    return Math.floor(100000 + Math.random() * 900000).toString();
+    return crypto.randomInt(100000, 999999).toString();
   }
   
   // ============================================================================
   // HTTP Request Handling (for webhooks)
   // ============================================================================
   
-  private handleHttpRequest(req: IncomingMessage, res: any): void {
+  private handleHttpRequest(req: IncomingMessage, res: ServerResponse): void {
     const url = req.url || '/';
     
     // Health check endpoint
@@ -563,7 +569,7 @@ export class RemoteGateway extends EventEmitter {
     res.end(JSON.stringify({ error: 'Not found' }));
   }
   
-  private handleWebhook(req: IncomingMessage, res: any, url: string): void {
+  private handleWebhook(req: IncomingMessage, res: ServerResponse, url: string): void {
     // Extract channel type from URL: /webhook/feishu, /webhook/telegram, etc.
     const channelType = url.split('/')[2] as ChannelType;
     
@@ -578,34 +584,49 @@ export class RemoteGateway extends EventEmitter {
     
     // Collect request body
     let body = '';
+    const MAX_BODY_SIZE = 1024 * 1024; // 1MB limit
+    let bodyTooLarge = false;
     req.on('data', (chunk: Buffer) => {
+      if (bodyTooLarge) return;
       body += chunk.toString();
+      if (body.length > MAX_BODY_SIZE) {
+        bodyTooLarge = true;
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Request body too large' }));
+      }
     });
     
     req.on('end', () => {
-      log(`[Gateway] Webhook body received, length: ${body.length}`);
-      
-      // Check if there are listeners for this webhook event
-      const listenerCount = this.listenerCount(`webhook:${channelType}`);
-      log(`[Gateway] Listeners for webhook:${channelType}: ${listenerCount}`);
-      
-      if (listenerCount === 0) {
-        log(`[Gateway] No listeners for webhook:${channelType}, returning OK`);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ code: 0 }));
-        return;
+      if (bodyTooLarge) return;
+      try {
+        log(`[Gateway] Webhook body received, length: ${body.length}`);
+        
+        // Check if there are listeners for this webhook event
+        const listenerCount = this.listenerCount(`webhook:${channelType}`);
+        log(`[Gateway] Listeners for webhook:${channelType}: ${listenerCount}`);
+        
+        if (listenerCount === 0) {
+          log(`[Gateway] No listeners for webhook:${channelType}, returning OK`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ code: 0 }));
+          return;
+        }
+        
+        // Emit webhook event for channel to handle
+        this.emit(`webhook:${channelType}`, {
+          headers: req.headers,
+          body,
+          respond: (status: number, data: unknown) => {
+            log(`[Gateway] Webhook response: ${status}`, data);
+            res.writeHead(status, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(data));
+          },
+        });
+      } catch (error) {
+        logError('[Gateway] Error processing webhook body:', error);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Internal server error' }));
       }
-      
-      // Emit webhook event for channel to handle
-      this.emit(`webhook:${channelType}`, {
-        headers: req.headers,
-        body,
-        respond: (status: number, data: unknown) => {
-          log(`[Gateway] Webhook response: ${status}`, data);
-          res.writeHead(status, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(data));
-        },
-      });
     });
   }
   
@@ -615,19 +636,25 @@ export class RemoteGateway extends EventEmitter {
   
   private handleWSConnection(ws: WebSocket, _req: IncomingMessage): void {
     const clientId = this.generateClientId();
-    
+    const ip = _req.socket.remoteAddress || 'unknown';
+
     const client: WSClient = {
       id: clientId,
       ws,
       authenticated: false,
       connectedAt: Date.now(),
+      ip,
     };
     
     this.wsClients.set(clientId, client);
     log('[Gateway] WebSocket client connected:', clientId);
     
     ws.on('message', (data: Buffer) => {
-      this.handleWSMessage(client, data);
+      try {
+        this.handleWSMessage(client, data);
+      } catch (error) {
+        logError('[Gateway] Error handling WS message:', error);
+      }
     });
     
     ws.on('close', () => {
@@ -656,7 +683,9 @@ export class RemoteGateway extends EventEmitter {
           break;
           
         case 'message':
-          this.handleWSClientMessage(client, message);
+          void this.handleWSClientMessage(client, message).catch((error) => {
+            logError('[Gateway] Error handling WS client message:', error);
+          });
           break;
           
         case 'ping':
@@ -671,7 +700,28 @@ export class RemoteGateway extends EventEmitter {
     }
   }
   
+  private checkAuthRateLimit(ip: string): boolean {
+    const now = Date.now();
+    const attempt = this.authAttempts.get(ip);
+    if (!attempt || now > attempt.resetTime) {
+      this.authAttempts.set(ip, { count: 1, resetTime: now + 60000 });
+      return true;
+    }
+    attempt.count++;
+    return attempt.count <= 5;
+  }
+
   private handleWSAuth(client: WSClient, message: WSMessage): void {
+    // Rate limit auth attempts by IP
+    if (!this.checkAuthRateLimit(client.ip)) {
+      this.sendWSMessage(client.ws, {
+        type: 'auth_result',
+        payload: { success: false, error: 'Too many auth attempts. Try again later.' },
+        requestId: message.requestId,
+      });
+      return;
+    }
+
     const { token } = message.payload as { token?: string };
     
     if (this.config.auth.mode === 'token') {
@@ -702,37 +752,41 @@ export class RemoteGateway extends EventEmitter {
   }
   
   private async handleWSClientMessage(client: WSClient, message: WSMessage): Promise<void> {
-    if (!client.authenticated) {
-      this.sendWSMessage(client.ws, {
-        type: 'error',
-        payload: { error: 'Not authenticated' },
-        requestId: message.requestId,
-      });
-      return;
+    try {
+      if (!client.authenticated) {
+        this.sendWSMessage(client.ws, {
+          type: 'error',
+          payload: { error: 'Not authenticated' },
+          requestId: message.requestId,
+        });
+        return;
+      }
+      
+      const { text } = message.payload as { text: string; sessionId?: string };
+      
+      // Create a remote message from WS client
+      const remoteMessage: RemoteMessage = {
+        id: this.generateMessageId(),
+        channelType: 'websocket',
+        channelId: client.id,
+        sender: {
+          id: client.userId || client.id,
+          isBot: false,
+        },
+        content: {
+          type: 'text',
+          text,
+        },
+        timestamp: Date.now(),
+        isGroup: false,
+        isMentioned: true,
+      };
+      
+      // Route to agent
+      await this.messageRouter.routeMessage(remoteMessage);
+    } catch (error) {
+      logError('[Gateway] Error in handleWSClientMessage:', error);
     }
-    
-    const { text } = message.payload as { text: string; sessionId?: string };
-    
-    // Create a remote message from WS client
-    const remoteMessage: RemoteMessage = {
-      id: this.generateMessageId(),
-      channelType: 'websocket',
-      channelId: client.id,
-      sender: {
-        id: client.userId || client.id,
-        isBot: false,
-      },
-      content: {
-        type: 'text',
-        text,
-      },
-      timestamp: Date.now(),
-      isGroup: false,
-      isMentioned: true,
-    };
-    
-    // Route to agent
-    await this.messageRouter.routeMessage(remoteMessage);
   }
   
   private sendWSMessage(ws: WebSocket, message: WSMessage): void {
@@ -753,15 +807,16 @@ export class RemoteGateway extends EventEmitter {
   }
   
   private generateClientId(): string {
-    return `ws-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+    return `ws-${Date.now()}-${crypto.randomUUID()}`;
   }
-  
+
   private generateMessageId(): string {
-    return `msg-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+    return `msg-${Date.now()}-${crypto.randomUUID()}`;
   }
   
   private emitEvent(type: string, data: unknown): void {
     const event: GatewayEvent = {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       type: type as any,
       timestamp: Date.now(),
       data,
