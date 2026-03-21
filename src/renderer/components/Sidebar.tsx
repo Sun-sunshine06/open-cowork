@@ -17,8 +17,7 @@ import {
 } from 'lucide-react';
 import type { Session } from '../types';
 
-// Served from public/ as a static asset — works in both dev and packaged builds
-const sidebarLogoSrc = '/logo.png';
+import sidebarLogoSrc from '../assets/logo.png';
 
 type SessionGroup = {
   key: string;
